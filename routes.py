@@ -17,6 +17,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import torch
 from skills import TECH_SKILLS  # Import the TECH_SKILLS dictionary
+from metrics import calculate_matching_metrics  # Import the metrics module
+from test_generator import generate_test  # Import the test generator module
+from open_application import OpenApplicationProcessor  # Import the open application processor
 
 # Configure logging
 logging.basicConfig(
@@ -42,6 +45,9 @@ r = redis.Redis(host='localhost', port=6379, db=0)
 # Initialize Sentence-Transformers model
 model_name = 'paraphrase-multilingual-MiniLM-L12-v2'
 sentence_model = SentenceTransformer(model_name)
+
+# Initialize the OpenApplicationProcessor
+open_application_processor = OpenApplicationProcessor(cv_collection, offers_collection, sentence_model)
 
 # Utility functions for semantic matching
 def get_embedding(text):
@@ -358,6 +364,106 @@ def calculate_skill_match(cv_skills, job_keywords):
     
     return round(final_score, 1), all_matches
 
+def calculate_matching_metrics(candidate_skills, job_requirements, matched_skills):
+    """
+    Calculate precision, recall, F1-score and accuracy for skill matching
+    
+    Args:
+        candidate_skills (list): List of skills from the candidate's CV
+        job_requirements (list): List of required skills from the job description
+        matched_skills (list): List of skills that matched between CV and job
+        
+    Returns:
+        dict: Dictionary containing various matching metrics
+    """
+    if not candidate_skills or not job_requirements:
+        return {
+            "precision": 0,
+            "recall": 0,
+            "f1_score": 0,
+            "accuracy": 0,
+            "loss": 1.0
+        }
+    
+    # Normalize all to lowercase for comparison
+    candidate_skills_lower = [s.lower() for s in candidate_skills]
+    job_requirements_lower = [s.lower() for s in job_requirements]
+    matched_skills_lower = [s.lower() for s in matched_skills]
+    
+    # Calculate true positives, false positives, and false negatives
+    true_positives = len(matched_skills_lower)  # Skills that matched
+    
+    # False positives: skills incorrectly matched (shouldn't happen in our case, but kept for completeness)
+    false_positives = sum(1 for skill in matched_skills_lower if skill not in job_requirements_lower)
+    
+    # False negatives: required skills missing from matches
+    false_negatives = sum(1 for skill in job_requirements_lower if skill not in matched_skills_lower)
+    
+    # True negatives: skills correctly not matched (skills not in CV and not required by job)
+    # This is harder to define precisely, but we can approximate:
+    all_unique_skills = set(candidate_skills_lower).union(set(job_requirements_lower))
+    true_negatives = len(all_unique_skills) - (true_positives + false_positives + false_negatives)
+    
+    # Calculate precision: what percentage of matched skills were actually required
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    
+    # Calculate recall: what percentage of required skills were matched
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    
+    # Calculate F1 score: harmonic mean of precision and recall
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    # Calculate accuracy: percentage of correct predictions (true positives + true negatives)
+    total = true_positives + false_positives + false_negatives + true_negatives
+    accuracy = (true_positives + true_negatives) / total if total > 0 else 0
+    
+    # Calculate loss using cross-entropy inspired approach
+    # Higher loss when important skills are missing
+    if job_requirements_lower:
+        matched_ratio = len(matched_skills_lower) / len(job_requirements_lower)
+        # Loss is higher when fewer job requirements are matched
+        loss = 1.0 - matched_ratio
+    else:
+        loss = 0.0
+        
+    # Apply weighting to prioritize matching critical skills
+    critical_skill_count = 0
+    matched_critical_count = 0
+    
+    # Some skills might be more important than others (e.g., programming languages)
+    critical_categories = ["programming", "language", "framework", "database", "cloud"]
+    
+    for skill in job_requirements_lower:
+        if any(category in skill for category in critical_categories):
+            critical_skill_count += 1
+            if skill in matched_skills_lower:
+                matched_critical_count += 1
+    
+    # If there are critical skills, adjust metrics accordingly
+    if critical_skill_count > 0:
+        critical_recall = matched_critical_count / critical_skill_count
+        # Blend regular recall with critical recall (60% weight to critical skills)
+        adjusted_recall = (recall * 0.4) + (critical_recall * 0.6)
+        
+        # Adjust loss to penalize missing critical skills more heavily
+        critical_loss = 1.0 - critical_recall
+        loss = (loss * 0.4) + (critical_loss * 0.6)
+        
+        # Update other metrics
+        if precision > 0:
+            f1_score = 2 * (precision * adjusted_recall) / (precision + adjusted_recall)
+    
+    # Ensure all values are between 0 and 1, then convert to percentages
+    metrics = {
+        "precision": round(precision * 100, 1),
+        "recall": round(recall * 100, 1),
+        "f1_score": round(f1_score * 100, 1),
+        "accuracy": round(accuracy * 100, 1),
+        "loss": round(loss, 3)
+    }
+    
+    return metrics
+
 # Define all routes on the Blueprint
 @bp.route('/job-offers', methods=['POST'])
 def create_job_offer():
@@ -491,6 +597,17 @@ def apply_to_offer():
         final_score = (skill_match_score * 0.7) + (semantic_similarity * 0.3)
         final_score = max(10, min(100, final_score))
         
+        # Calculer les métriques précises (precision, recall, F1, accuracy et loss)
+        metrics = calculate_matching_metrics(entities.get('skills', []), job_keywords, matched_skills)
+        
+        # Ajuster le score final en tenant compte des métriques
+        # Si le F1-score est disponible, l'utiliser pour ajuster le score final
+        if metrics['f1_score'] > 0:
+            # Blend traditional score (60%) with F1-based score (40%)
+            f1_based_score = metrics['f1_score'] 
+            adjusted_final_score = (final_score * 0.6) + (f1_based_score * 0.4)
+            final_score = max(10, min(100, adjusted_final_score))
+        
         application_id = cv_collection.insert_one({
             'offer_id': offer_id,
             'cv_text': sanitized_cv_text,
@@ -502,7 +619,8 @@ def apply_to_offer():
                 'semantic_similarity': round(semantic_similarity, 1),
                 'final_score': round(final_score, 1),
                 'matched_skills': matched_skills,
-                'job_keywords': job_keywords
+                'job_keywords': job_keywords,
+                'metrics': metrics
             },
             'date_applied': datetime.now()
         }).inserted_id
@@ -526,10 +644,11 @@ def apply_to_offer():
                 'score': round(final_score, 1),
                 'skill_match_score': skill_match_score,
                 'semantic_similarity': round(semantic_similarity, 1),
-                'matched_skills': matched_skills
+                'matched_skills': matched_skills,
+                'metrics': metrics
             }
         }
-        logger.info(f"Candidature traitée avec succès - Matching score: {final_score}")
+        logger.info(f"Candidature traitée avec succès - Matching score: {final_score}, F1-score: {metrics['f1_score']}")
         return jsonify(response), 200
     except Exception as e:
         logger.error(f"Erreur lors du traitement: {str(e)}", exc_info=True)
@@ -630,6 +749,121 @@ def extract_professional_sections(cv_text):
             sections[current_section] += para + "\n\n"
     
     return sections
+
+@bp.route('/apply-open', methods=['POST'])
+def apply_open():
+    """
+    Route pour les candidatures libres sans ID d'offre spécifique.
+    Le système trouve automatiquement les offres d'emploi les plus adaptées au CV.
+    """
+    try:
+        logger.info("Requête reçue sur /apply-open")
+        if 'cv' not in request.files:
+            return jsonify({'error': 'Le CV est requis'}), 400
+        
+        cv_file = request.files['cv']
+        if cv_file.filename == '':
+            return jsonify({'error': 'Aucun fichier sélectionné'}), 400
+        
+        # Extraire le texte du CV
+        cv_text = ""
+        filename = cv_file.filename
+        if filename.endswith('.pdf'):
+            import PyPDF2
+            pdf_reader = PyPDF2.PdfReader(cv_file)
+            for page in pdf_reader.pages:
+                cv_text += page.extract_text() + "\n"
+        elif filename.endswith('.docx'):
+            import docx2txt
+            cv_text = docx2txt.process(cv_file)
+        elif filename.endswith('.txt'):
+            cv_text = cv_file.read().decode('utf-8')
+        else:
+            return jsonify({'error': 'Format de fichier non supporté'}), 400
+        
+        # Extraire les entités et compétences
+        entities = extract_entities(cv_text)
+        phone = extract_phone_numbers(cv_text)
+        if phone:
+            entities['telephone'] = phone
+        
+        extracted_skills = optimize_skill_extraction(cv_text)
+        entities['skills'] = extracted_skills
+        
+        # Nettoyer les données sensibles du CV
+        sanitized_cv_text = remove_sensitive_data(cv_text)
+        
+        # Extraire les informations personnelles
+        personal_info = {
+            'name': entities.get('name', 'Nom non détecté'),
+            'email': entities.get('email', 'Email non détecté'),
+            'telephone': entities.get('telephone', 'Téléphone non détecté')
+        }
+        
+        # Générer un résumé optimisé
+        optimized_resume = generate_candidate_summary(entities.get('skills', []), entities.get('experience', []))
+        
+        # Traiter la candidature libre
+        response, status_code = open_application_processor.process_open_application(
+            cv_text, 
+            entities, 
+            sanitized_cv_text, 
+            personal_info, 
+            optimized_resume,
+            calculate_matching_metrics
+        )
+        
+        if status_code == 200:
+            logger.info(f"Candidature libre traitée avec succès - ID: {response['application_id']}")
+        else:
+            logger.warning(f"Problème lors du traitement de la candidature libre: {response.get('error', 'Erreur inconnue')}")
+            
+        return jsonify(response), status_code
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du traitement de la candidature libre: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/generate-test', methods=['POST'])
+def generate_job_test():
+    """
+    Génère un test automatisé basé sur les mots-clés et le titre de l'offre d'emploi
+    en utilisant llama3 via Ollama pour la génération de contenu RAG.
+    """
+    try:
+        logger.info("Requête reçue sur /generate-test")
+        data = request.json
+        
+        # Vérifier si nous avons un objet job_offer
+        if not data or 'job_offer' not in data:
+            return jsonify({'error': 'Les données de l\'offre d\'emploi sont requises'}), 400
+        
+        job_offer = data['job_offer']
+        
+        # Vérifier les champs requis
+        if 'keywords' not in job_offer:
+            return jsonify({'error': 'Les mots-clés de l\'offre sont requis'}), 400
+        
+        # Générer le test
+        test_data = generate_test(job_offer)
+        
+        if 'error' in test_data:
+            return jsonify({'error': test_data['error']}), 500
+        
+        # Enregistrer le test dans la base de données si nécessaire
+        # Ici, vous pourriez stocker le test avec une association à l'offre d'emploi
+        
+        return jsonify({
+            'test': test_data,
+            'job_offer': {
+                'title': job_offer.get('title', 'Non spécifié'),
+                'keywords': job_offer.get('keywords', [])
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la génération du test: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 # Initialize Flask routes
 def init_routes(app):
