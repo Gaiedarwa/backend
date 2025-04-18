@@ -139,6 +139,9 @@ def optimize_skill_extraction(text, job_related=False):
     Returns:
         list: List of extracted skills
     """
+    if not text:
+        return []
+        
     # Base technical skills from our dictionary
     tech_skills = extract_skills_improved(text) if 'extract_skills_improved' in globals() else []
     
@@ -205,12 +208,15 @@ def optimize_skill_extraction(text, job_related=False):
         ]
         
         for pattern in requirement_patterns:
-            matches = re.finditer(r'\b' + pattern + r'\b(.*?)(?:\.|;|\n)', text, re.IGNORECASE)
+            # Correction ici pour éviter l'erreur quand match.group(1) est None
+            matches = re.finditer(r'\b' + pattern + r'\b(.*?)(?:\.|;|\n|$)', text, re.IGNORECASE)
             for match in matches:
-                req_text = match.group(1).lower()
-                for skill in additional_tech_terms:
-                    if skill.lower() in req_text:
-                        found_skills.add(skill)
+                # Vérifier si le groupe est None avant d'appeler lower()
+                if match.group(1) is not None:
+                    req_text = match.group(1).lower()
+                    for skill in additional_tech_terms:
+                        if skill.lower() in req_text:
+                            found_skills.add(skill)
     
     # Normalize and clean skills
     cleaned_skills = []
@@ -464,87 +470,70 @@ def calculate_matching_metrics(candidate_skills, job_requirements, matched_skill
     
     return metrics
 
-# Define all routes on the Blueprint
-@bp.route('/job-offers', methods=['POST'])
-def create_job_offer():
-    try:
-        logger.info("Requête reçue sur /job-offers")
-        data = request.json
-        required_fields = ['title', 'company', 'description']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({'error': f'Le champ {field} est requis'}), 400
-        description = generate_job_description(data['description'])
-        job_offer = {
-            'title': data['title'],
-            'company': data['company'],
-            'location': data.get('location', ''),
-            'level': data.get('level', ''),
-            'description': description['description'],
-            'keywords': description['keywords'],
-            'requirements': description['requirements'],
-            'responsibilities': description['responsibilities']
-        }
-        job_id = offers_collection.insert_one(job_offer).inserted_id
-        job_id = str(job_id)
-        return jsonify({'job_id': job_id, 'job_offer': job_offer}), 201
-    except Exception as e:
-        logger.error(f"Erreur lors du traitement: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
-
-@bp.route('/job-offers', methods=['GET'])
-def get_all_offers():
-    try:
-        offers = list(offers_collection.find())
-        for offer in offers:
-            offer["_id"] = str(offer["_id"])
-        return jsonify(offers)
-    except Exception as e:
-        logging.error(f"Error in get_all_offers: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-@bp.route('/job-offers/<offer_id>', methods=['GET'])
-def get_offer_by_id(offer_id):
-    try:
-        offer = offers_collection.find_one({"_id": ObjectId(offer_id)})
-        if not offer:
-            return jsonify({"error": "Offre non trouvée"}), 404
-        offer["_id"] = str(offer["_id"])
-        return jsonify(offer)
-    except Exception as e:
-        logging.error(f"Error in get_offer_by_id: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
 @bp.route('/apply', methods=['POST'])
 def apply_to_offer():
     try:
         logger.info("Requête reçue sur /apply")
         if 'cv' not in request.files or 'offer_id' not in request.form:
             return jsonify({'error': 'Le CV et l\'ID de l\'offre sont requis'}), 400
+        
         cv_file = request.files['cv']
         offer_id = request.form['offer_id']
         if cv_file.filename == '':
             return jsonify({'error': 'Aucun fichier sélectionné'}), 400
+        
+        # Extraire le texte du CV
         cv_text = ""
-        filename = cv_file.filename
-        if filename.endswith('.pdf'):
-            import PyPDF2
-            pdf_reader = PyPDF2.PdfReader(cv_file)
-            for page in pdf_reader.pages:
-                cv_text += page.extract_text() + "\n"
-        elif filename.endswith('.docx'):
-            import docx2txt
-            cv_text = docx2txt.process(cv_file)
-        elif filename.endswith('.txt'):
-            cv_text = cv_file.read().decode('utf-8')
-        else:
-            return jsonify({'error': 'Format de fichier non supporté'}), 400
+        filename = cv_file.filename.lower()  # Normaliser l'extension en minuscules
         
-        job_offer = offers_collection.find_one({'_id': ObjectId(offer_id)})
-        if not job_offer:
-            return jsonify({'error': 'Offre d\'emploi non trouvée'}), 404
+        try:
+            if filename.endswith('.pdf'):
+                import PyPDF2
+                pdf_reader = PyPDF2.PdfReader(cv_file)
+                for page in pdf_reader.pages:
+                    cv_text += page.extract_text() + "\n"
+            elif filename.endswith('.docx'):
+                import docx2txt
+                cv_text = docx2txt.process(cv_file)
+            elif filename.endswith('.txt'):
+                cv_text = cv_file.read().decode('utf-8')
+            elif any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png']):
+                # OCR pour les images
+                try:
+                    import pytesseract
+                    from PIL import Image
+                    import io
+                    
+                    image = Image.open(io.BytesIO(cv_file.read()))
+                    cv_text = pytesseract.image_to_string(image, lang='fra+eng')
+                except ImportError:
+                    return jsonify({'error': 'Bibliothèques pour le traitement d\'image non installées. Essayez: pip install pytesseract Pillow'}), 500
+            else:
+                return jsonify({'error': 'Format de fichier non supporté. Utilisez PDF, DOCX, TXT ou JPG/PNG'}), 400
+        except Exception as file_error:
+            logger.error(f"Erreur lors de l'extraction du texte du CV: {str(file_error)}")
+            return jsonify({'error': f"Erreur lors de l'extraction du texte du CV: {str(file_error)}"}), 400
         
+        # Vérifier si le texte a été correctement extrait
+        if not cv_text or len(cv_text.strip()) < 50:
+            return jsonify({'error': 'Impossible d\'extraire suffisamment de texte du CV. Vérifiez que le fichier n\'est pas corrompu ou vide.'}), 400
+        
+        # Récupérer l'offre d'emploi
+        try:
+            job_offer = offers_collection.find_one({'_id': ObjectId(offer_id)})
+            if not job_offer:
+                return jsonify({'error': 'Offre d\'emploi non trouvée'}), 404
+        except Exception as db_error:
+            logger.error(f"Erreur lors de la récupération de l'offre: {str(db_error)}")
+            return jsonify({'error': f"Erreur lors de la récupération de l'offre: {str(db_error)}"}), 400
+        
+        # Extraire les entités et les compétences
         entities = extract_entities(cv_text)
+        
+        # Améliorer la détection du nom avec la nouvelle fonction
+        detected_name = extract_name_improved(cv_text)
+        if detected_name:
+            entities['name'] = detected_name
         
         # Améliorer la détection du numéro de téléphone
         phone = extract_phone_numbers(cv_text)
@@ -582,51 +571,67 @@ def apply_to_offer():
         professional_content = professional_content.strip()
         
         # Utiliser le contenu professionnel pour générer le résumé
-        optimized_resume = generate_candidate_summary(entities.get('skills', []), entities.get('experience', []))
+        try:
+            optimized_resume = generate_candidate_summary(entities.get('skills', []), entities.get('experience', []))
+        except Exception as resume_error:
+            logger.error(f"Erreur lors de la génération du résumé: {str(resume_error)}")
+            optimized_resume = "Résumé non disponible en raison d'une erreur de traitement."
         
         # Calculer la correspondance des compétences et la similarité sémantique avec l'algorithme amélioré
-        skill_match_score, matched_skills = calculate_skill_match(entities.get('skills', []), job_keywords)
+        try:
+            skill_match_score, matched_skills = calculate_skill_match(entities.get('skills', []), job_keywords)
+            
+            # Calculer similarité sémantique avec la fonction améliorée
+            semantic_similarity = calculate_semantic_similarity_enhanced(
+                sanitized_cv_text,
+                job_offer.get('description', '')
+            ) * 100
+            
+            # Calculer score final (combinaison pondérée)
+            final_score = (skill_match_score * 0.7) + (semantic_similarity * 0.3)
+            final_score = max(10, min(100, final_score))
+            
+            # Calculer des métriques détaillées, mais ne pas les inclure dans la réponse principale
+            metrics = calculate_matching_metrics(entities.get('skills', []), job_keywords, matched_skills)
+        except Exception as match_error:
+            logger.error(f"Erreur lors du calcul des scores de matching: {str(match_error)}")
+            skill_match_score = 50
+            semantic_similarity = 50
+            final_score = 50
+            matched_skills = []
+            metrics = {
+                "precision": 0,
+                "recall": 0, 
+                "f1_score": 0,
+                "accuracy": 0,
+                "loss": 1.0
+            }
         
-        # Calculer similarité sémantique entre CV et description du poste
-        semantic_similarity = calculate_semantic_similarity(
-            get_embedding(sanitized_cv_text),
-            get_embedding(job_offer.get('description', ''))
-        ) * 100
+        # Enregistrer la candidature dans la base de données
+        try:
+            application_id = cv_collection.insert_one({
+                'offer_id': offer_id,
+                'cv_text': sanitized_cv_text,
+                'entities': entities,
+                'personal_info': personal_info,
+                'optimized_resume': optimized_resume,
+                'match_data': {
+                    'skill_match_score': skill_match_score,
+                    'semantic_similarity': round(semantic_similarity, 1),
+                    'final_score': round(final_score, 1),
+                    'matched_skills': matched_skills,
+                    'job_keywords': job_keywords,
+                    'metrics': metrics  # Conserver les métriques dans la base de données
+                },
+                'date_applied': datetime.now()
+            }).inserted_id
+            
+            application_id = str(application_id)
+        except Exception as db_error:
+            logger.error(f"Erreur lors de l'enregistrement en base de données: {str(db_error)}")
+            return jsonify({'error': f"Erreur lors de l'enregistrement de la candidature: {str(db_error)}"}), 500
         
-        # Calculer score final (combinaison pondérée)
-        final_score = (skill_match_score * 0.7) + (semantic_similarity * 0.3)
-        final_score = max(10, min(100, final_score))
-        
-        # Calculer les métriques précises (precision, recall, F1, accuracy et loss)
-        metrics = calculate_matching_metrics(entities.get('skills', []), job_keywords, matched_skills)
-        
-        # Ajuster le score final en tenant compte des métriques
-        # Si le F1-score est disponible, l'utiliser pour ajuster le score final
-        if metrics['f1_score'] > 0:
-            # Blend traditional score (60%) with F1-based score (40%)
-            f1_based_score = metrics['f1_score'] 
-            adjusted_final_score = (final_score * 0.6) + (f1_based_score * 0.4)
-            final_score = max(10, min(100, adjusted_final_score))
-        
-        application_id = cv_collection.insert_one({
-            'offer_id': offer_id,
-            'cv_text': sanitized_cv_text,
-            'entities': entities,
-            'personal_info': personal_info,
-            'optimized_resume': optimized_resume,
-            'match_data': {
-                'skill_match_score': skill_match_score,
-                'semantic_similarity': round(semantic_similarity, 1),
-                'final_score': round(final_score, 1),
-                'matched_skills': matched_skills,
-                'job_keywords': job_keywords,
-                'metrics': metrics
-            },
-            'date_applied': datetime.now()
-        }).inserted_id
-        
-        application_id = str(application_id)
-        
+        # Préparer la réponse sans inclure les métriques
         response = {
             'application_id': application_id,
             'candidate': {
@@ -644,15 +649,219 @@ def apply_to_offer():
                 'score': round(final_score, 1),
                 'skill_match_score': skill_match_score,
                 'semantic_similarity': round(semantic_similarity, 1),
-                'matched_skills': matched_skills,
-                'metrics': metrics
+                'matched_skills': matched_skills
+                # Métriques détaillées supprimées de la réponse principale
             }
         }
-        logger.info(f"Candidature traitée avec succès - Matching score: {final_score}, F1-score: {metrics['f1_score']}")
+        
+        logger.info(f"Candidature traitée avec succès - ID: {application_id}, Score: {final_score}")
         return jsonify(response), 200
+        
     except Exception as e:
         logger.error(f"Erreur lors du traitement: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+@bp.route('/job-offers', methods=['POST'])
+def job_offers_post():
+    
+    try:
+        logger.info("Requête reçue sur /api/job-offers (POST)")
+        
+        # Vérifier d'abord si on a des données JSON
+        if request.is_json:
+            data = request.json
+            if not data:
+                return jsonify({'error': 'Données JSON requises ou fichier d\'offre d\'emploi'}), 400
+            
+            required_fields = ['title', 'company']
+            for field in required_fields:
+                if field not in data:
+                    return jsonify({'error': f'Le champ {field} est requis'}), 400
+            
+            title = data['title']
+            company = data['company']
+            location = data.get('location', '')
+            level = data.get('level', '')
+            description_text = data.get('description', '')
+            
+            # Récupérer les mots-clés s'ils sont fournis
+            if 'keywords' in data:
+                if isinstance(data['keywords'], list):
+                    keywords = data['keywords']
+                else:
+                    keywords = [k.strip() for k in data['keywords'].split(',')]
+            else:
+                # Extraire les mots-clés du texte
+                keywords = optimize_skill_extraction(description_text, job_related=True)
+            
+            # Générer une description enrichie si nécessaire
+            if description_text:
+                desc_result = generate_job_description(keywords)
+                
+                # Vérifier si le résultat est un dictionnaire
+                if isinstance(desc_result, dict):
+                    description = desc_result.get('description', description_text)
+                    # N'écrasez les mots-clés que s'ils n'ont pas été fournis
+                    if not keywords:
+                        keywords = desc_result.get('keywords', [])
+                    requirements = desc_result.get('requirements', [])
+                    responsibilities = desc_result.get('responsibilities', [])
+                else:
+                    description = desc_result if desc_result else description_text
+                    if not keywords:
+                        keywords = optimize_skill_extraction(description_text, job_related=True)
+                    requirements = []
+                    responsibilities = []
+            else:
+                description = ""
+                requirements = []
+                responsibilities = []
+            
+            # Création de l'objet job_offer
+            job_offer = {
+                'title': title,
+                'company': company,
+                'location': location,
+                'level': level,
+                'description': description,
+                'keywords': keywords,
+                'requirements': requirements,
+                'responsibilities': responsibilities,
+                'created_at': datetime.now()
+            }
+            
+            # Insertion en base de données
+            job_id = offers_collection.insert_one(job_offer).inserted_id
+            job_offer['_id'] = str(job_id)
+            
+            return jsonify({'job_id': str(job_id), 'job_offer': job_offer}), 201
+        
+        # Si pas de JSON, chercher le fichier dans la requête
+        job_file = None
+        
+        # Vérifier tous les noms possibles du fichier
+        if 'job_document' in request.files and request.files['job_document'].filename:
+            job_file = request.files['job_document']
+        elif 'offer' in request.files and request.files['offer'].filename:
+            job_file = request.files['offer']
+        
+        # Si aucun fichier trouvé
+        if not job_file:
+            return jsonify({'error': 'Un fichier PDF ou image est requis'}), 400
+            
+        # Extraire le texte du fichier
+        job_text = ""
+        filename = job_file.filename.lower()
+        
+        try:
+            if filename.endswith('.pdf'):
+                # Extraction de texte du PDF
+                import PyPDF2
+                pdf_reader = PyPDF2.PdfReader(job_file)
+                for page in pdf_reader.pages:
+                    job_text += page.extract_text() + "\n"
+            elif any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png']):
+                # OCR pour les images
+                try:
+                    import pytesseract
+                    from PIL import Image
+                    import io
+                    
+                    image = Image.open(io.BytesIO(job_file.read()))
+                    job_text = pytesseract.image_to_string(image, lang='fra+eng')
+                except ImportError:
+                    return jsonify({'error': 'Libraries for image processing not installed. Try: pip install pytesseract Pillow'}), 500
+            else:
+                return jsonify({'error': 'Format de fichier non supporté. Utilisez PDF, JPG ou PNG'}), 400
+        except Exception as file_error:
+            logger.error(f"Erreur lors de l'extraction du texte du fichier: {str(file_error)}")
+            return jsonify({'error': f"Erreur lors de l'extraction du texte du fichier: {str(file_error)}"}), 400
+        
+        # Récupérer texte supplémentaire (optionnel) - toujours optionnel même si le texte extrait est vide
+        additional_text = request.form.get('job_text', '')
+        if additional_text:
+            job_text = job_text + "\n\n" + additional_text
+        
+        # Si le texte extrait est vide et qu'il n'y a pas de texte supplémentaire, ce n'est pas un problème
+        # On continue avec un texte vide et on se base sur les métadonnées
+        
+        # Récupérer les autres métadonnées
+        title = request.form.get('title', 'Poste non spécifié')
+        company = request.form.get('company', 'Entreprise non spécifiée')
+        location = request.form.get('location', '')
+        level = request.form.get('level', '')
+        
+        # Extraire les mots-clés si possible ou utiliser une liste vide
+        keywords = []
+        if job_text:
+            keywords = optimize_skill_extraction(job_text, job_related=True)
+        
+        # Générer une description enrichie si possible
+        enriched_description = ""
+        requirements = []
+        responsibilities = []
+        
+        if keywords:
+            try:
+                desc_result = generate_job_description(keywords)
+                
+                # Si la génération a retourné un dictionnaire, utiliser ses valeurs
+                if isinstance(desc_result, dict):
+                    enriched_description = desc_result.get('description', '')
+                    requirements = desc_result.get('requirements', [])
+                    responsibilities = desc_result.get('responsibilities', [])
+                else:
+                    enriched_description = desc_result if desc_result else job_text
+            except Exception as gen_error:
+                logger.error(f"Erreur lors de la génération de la description: {str(gen_error)}")
+        
+        # Construire l'objet d'offre d'emploi
+        job_offer = {
+            'title': title,
+            'company': company,
+            'location': location,
+            'level': level,
+            'description': job_text,  # Texte brut de l'offre (peut être vide)
+            'enriched_description': enriched_description,  # Description enrichie par l'IA (peut être vide)
+            'keywords': keywords,
+            'requirements': requirements,
+            'responsibilities': responsibilities,
+            'created_at': datetime.now(),
+            'source': 'file_upload'
+        }
+        
+        # Insertion en base de données
+        job_id = offers_collection.insert_one(job_offer).inserted_id
+        job_offer['_id'] = str(job_id)
+        
+        return jsonify({'job_id': str(job_id), 'job_offer': job_offer}), 201
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du traitement: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/job-offers', methods=['GET'])
+def get_all_offers():
+    try:
+        offers = list(offers_collection.find())
+        for offer in offers:
+            offer["_id"] = str(offer["_id"])
+        return jsonify(offers)
+    except Exception as e:
+        logging.error(f"Error in get_all_offers: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@bp.route('/job-offers/<offer_id>', methods=['GET'])
+def get_offer_by_id(offer_id):
+    try:
+        offer = offers_collection.find_one({"_id": ObjectId(offer_id)})
+        if not offer:
+            return jsonify({"error": "Offre non trouvée"}), 404
+        offer["_id"] = str(offer["_id"])
+        return jsonify(offer)
+    except Exception as e:
+        logging.error(f"Error in get_offer_by_id: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @bp.route('/postulations', methods=['GET'])
 def get_all_postulations():
@@ -824,46 +1033,482 @@ def apply_open():
         logger.error(f"Erreur lors du traitement de la candidature libre: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
+@bp.route('/application-metrics/<application_id>', methods=['GET'])
+def get_application_metrics(application_id):
+    """
+    Endpoint pour récupérer les métriques détaillées d'une candidature.
+    Permet de séparer ces données de la réponse principale pour alléger les requêtes.
+    """
+    try:
+        try:
+            application = cv_collection.find_one({'_id': ObjectId(application_id)})
+            if not application:
+                return jsonify({'error': 'Candidature non trouvée'}), 404
+        except Exception as e:
+            return jsonify({'error': f"ID de candidature invalide: {str(e)}"}), 400
+            
+        # Récupérer les métriques depuis les données stockées
+        metrics = application.get('match_data', {}).get('metrics', {})
+        if not metrics:
+            # Si aucune métrique n'est trouvée, on peut les recalculer
+            entities = application.get('entities', {})
+            job_id = application.get('offer_id')
+            
+            try:
+                job_offer = offers_collection.find_one({'_id': ObjectId(job_id)})
+                job_keywords = job_offer.get('keywords', [])
+                matched_skills = application.get('match_data', {}).get('matched_skills', [])
+                
+                metrics = calculate_matching_metrics(
+                    entities.get('skills', []), 
+                    job_keywords,
+                    matched_skills
+                )
+            except Exception as calc_error:
+                logger.error(f"Erreur lors du recalcul des métriques: {str(calc_error)}")
+                metrics = {
+                    "precision": 0,
+                    "recall": 0,
+                    "f1_score": 0,
+                    "accuracy": 0,
+                    "loss": 1.0,
+                    "error": "Impossible de calculer les métriques"
+                }
+        
+        # Ajouter des métriques supplémentaires si nécessaire
+        detailed_metrics = {
+            **metrics,
+            'application_id': application_id,
+            'date_applied': application.get('date_applied', ''),
+            'skill_count': len(application.get('entities', {}).get('skills', [])),
+            'offer_keyword_count': len(application.get('match_data', {}).get('job_keywords', []))
+        }
+        
+        return jsonify({
+            'metrics': detailed_metrics,
+            'matching_details': {
+                'skill_match_score': application.get('match_data', {}).get('skill_match_score', 0),
+                'semantic_similarity': application.get('match_data', {}).get('semantic_similarity', 0),
+                'final_score': application.get('match_data', {}).get('final_score', 0)
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des métriques: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
 @bp.route('/generate-test', methods=['POST'])
 def generate_job_test():
     """
-    Génère un test automatisé basé sur les mots-clés et le titre de l'offre d'emploi
-    en utilisant llama3 via Ollama pour la génération de contenu RAG.
+    Génère un test automatisé basé sur les mots-clés et le titre de l'offre d'emploi.
+    
+    - Accepte soit un tableau de mots-clés directement, soit un objet job_offer contenant
+      ces mots-clés.
+    - Si les mots-clés sont fournis sous forme de chaîne, les convertit en tableau.
+    - Utilise le module test_generator.py pour créer un test adapté.
     """
     try:
         logger.info("Requête reçue sur /generate-test")
+        
+        # Vérifier si les données sont au format JSON
+        if not request.is_json:
+            return jsonify({'error': "Le type de contenu doit être 'application/json'"}), 415
+        
         data = request.json
+        keywords = []
         
-        # Vérifier si nous avons un objet job_offer
-        if not data or 'job_offer' not in data:
-            return jsonify({'error': 'Les données de l\'offre d\'emploi sont requises'}), 400
+        # Extraire les mots-clés - peut être dans data['keywords'] ou data['job_offer']['keywords']
+        if 'keywords' in data:
+            keywords = data['keywords']
+        elif 'job_offer' in data and 'keywords' in data['job_offer']:
+            keywords = data['job_offer']['keywords']
+        else:
+            return jsonify({'error': 'Les mots-clés sont requis pour générer un test'}), 400
         
-        job_offer = data['job_offer']
+        # S'assurer que keywords est une liste
+        if isinstance(keywords, str):
+            keywords = [k.strip() for k in keywords.split(',')]
         
-        # Vérifier les champs requis
-        if 'keywords' not in job_offer:
-            return jsonify({'error': 'Les mots-clés de l\'offre sont requis'}), 400
+        if not keywords:
+            return jsonify({'error': 'Liste de mots-clés vide'}), 400
         
-        # Générer le test
+        # Préparer un objet job_offer minimal pour l'API generate_test
+        job_offer = {
+            'keywords': keywords,
+            'title': data.get('title', data.get('job_offer', {}).get('title', 'Test de compétences')),
+            'niveau': data.get('niveau', data.get('job_offer', {}).get('niveau', 'standard'))
+        }
+        
+        logger.info(f"Génération d'un test pour les mots-clés: {keywords}")
         test_data = generate_test(job_offer)
         
         if 'error' in test_data:
+            logger.error(f"Erreur lors de la génération du test: {test_data['error']}")
             return jsonify({'error': test_data['error']}), 500
-        
-        # Enregistrer le test dans la base de données si nécessaire
-        # Ici, vous pourriez stocker le test avec une association à l'offre d'emploi
         
         return jsonify({
             'test': test_data,
             'job_offer': {
-                'title': job_offer.get('title', 'Non spécifié'),
-                'keywords': job_offer.get('keywords', [])
+                'title': job_offer.get('title'),
+                'keywords': job_offer.get('keywords'),
+                'niveau': job_offer.get('niveau')
             }
         }), 200
         
     except Exception as e:
         logger.error(f"Erreur lors de la génération du test: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+# Amélioration de la détection du nom pour éviter de confondre avec des sections de CV
+def extract_name_improved(cv_text):
+    """
+    Extrait le nom du candidat en évitant de confondre avec des titres de section.
+    
+    Args:
+        cv_text (str): Le texte du CV
+        
+    Returns:
+        str: Le nom détecté ou None
+    """
+    # Liste de titres de section courants à éviter
+    section_titles = [
+        "education", "formation", "expérience", "experience", "compétences", 
+        "skills", "profil", "profile", "résumé", "summary", "contact", "coordonnées",
+        "projets", "projects", "languages", "langues", "certifications", "références"
+    ]
+    
+    # Essayer de trouver le nom au début du CV
+    lines = cv_text.split('\n')
+    potential_names = []
+    
+    # Analyser les 10 premières lignes non vides
+    non_empty_count = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        non_empty_count += 1
+        if non_empty_count > 10:
+            break
+            
+        # Ignorer les lignes trop courtes ou trop longues
+        if len(line) < 3 or len(line) > 40:
+            continue
+            
+        # Ignorer les lignes qui sont des titres de section
+        if line.lower() in section_titles or any(title in line.lower() for title in section_titles):
+            continue
+            
+        # Ignorer les lignes qui contiennent des caractères spéciaux courants dans les emails/téléphones/adresses
+        if any(char in line for char in ['@', ':', '/', '\\', 'http']):
+            continue
+            
+        # Ignorer les lignes qui commencent par des caractères non alphabétiques
+        if line and not line[0].isalpha():
+            continue
+            
+        # Les noms ont tendance à avoir des majuscules
+        words = line.split()
+        if any(word and word[0].isupper() for word in words):
+            potential_names.append(line)
+    
+    # Prioriser les noms qui ont l'air d'être des noms propres (commençant par majuscule)
+    for name in potential_names:
+        words = name.split()
+        # Vérifier si le nom ressemble à un nom propre (2-3 mots commençant par une majuscule)
+        if 1 <= len(words) <= 3 and all(word and word[0].isupper() for word in words):
+            return name
+    
+    # Si aucun nom propre évident n'est trouvé, prendre le premier potentiel
+    if potential_names:
+        return potential_names[0]
+        
+    return None
+
+def calculate_semantic_similarity_enhanced(text1, text2):
+    """
+    Calcule une similarité sémantique améliorée entre deux textes.
+    Utilise une approche combinée avec embedding et extraction de mots-clés.
+    
+    Args:
+        text1 (str): Premier texte à comparer
+        text2 (str): Second texte à comparer
+        
+    Returns:
+        float: Score de similarité entre 0 et 1
+    """
+    if not text1 or not text2:
+        return 0.0
+    
+    # Tronquer les textes pour éviter les problèmes de mémoire
+    max_length = 5000
+    text1 = text1[:max_length] if len(text1) > max_length else text1
+    text2 = text2[:max_length] if len(text2) > max_length else text2
+    
+    # 1. Similarité par embedding
+    try:
+        embedding1 = get_embedding(text1)
+        embedding2 = get_embedding(text2)
+        cosine_sim = cosine_similarity(embedding1.reshape(1, -1), embedding2.reshape(1, -1))[0][0]
+    except Exception as e:
+        logger.warning(f"Erreur lors du calcul de la similarité par embedding: {str(e)}")
+        cosine_sim = 0.0
+    
+    # 2. Similarité basée sur les mots-clés/termes importants
+    try:
+        # Extraire les termes importants des deux textes
+        keywords1 = set(optimize_skill_extraction(text1))
+        keywords2 = set(optimize_skill_extraction(text2))
+        
+        # Calculer la similarité de Jaccard
+        if keywords1 and keywords2:
+            intersection = keywords1.intersection(keywords2)
+            union = keywords1.union(keywords2)
+            jaccard_sim = len(intersection) / len(union) if union else 0
+        else:
+            jaccard_sim = 0.0
+    except Exception as e:
+        logger.warning(f"Erreur lors du calcul de la similarité par mots-clés: {str(e)}")
+        jaccard_sim = 0.0
+    
+    # 3. Similarité basée sur le nombre de mots-clés communs (métrique simple mais efficace)
+    try:
+        common_keywords = keywords1.intersection(keywords2)
+        keyword_count_sim = len(common_keywords) / max(len(keywords1), len(keywords2)) if max(len(keywords1), len(keywords2)) > 0 else 0
+    except Exception as e:
+        logger.warning(f"Erreur lors du calcul de la similarité par mots communs: {str(e)}")
+        keyword_count_sim = 0.0
+    
+    # 4. Combinaison pondérée des similarités
+    # Donner plus de poids à l'embedding qui est généralement plus sophistiqué
+    final_similarity = (cosine_sim * 0.6) + (jaccard_sim * 0.2) + (keyword_count_sim * 0.2)
+    
+    return max(0.0, min(1.0, final_similarity))  # Garantir que la valeur est entre 0 et 1
+
+# Fonction pour générer des tests techniques à partir de mots-clés
+def generate_test(job_offer):
+    """
+    Génère un test technique basé sur les mots-clés de l'offre d'emploi.
+    
+    Args:
+        job_offer (dict): L'offre d'emploi contenant les mots-clés et éventuellement le niveau
+        
+    Returns:
+        dict: Un test technique avec des questions QCM et de code
+    """
+    try:
+        # S'assurer que job_offer contient les champs requis
+        if not job_offer or 'keywords' not in job_offer:
+            return {"error": "Les données de l'offre d'emploi sont incomplètes"}
+        
+        keywords = job_offer.get('keywords', [])
+        if not keywords:
+            return {"error": "Aucun mot-clé trouvé pour générer un test"}
+        
+        # Déterminer le niveau de difficulté en fonction du niveau du poste
+        niveau = job_offer.get('niveau', 'standard').lower()
+        
+        # Mapper les niveaux aux difficultés
+        difficulty_map = {
+            'junior': 'débutant',
+            'débutant': 'débutant',
+            'standard': 'intermédiaire',
+            'confirmé': 'intermédiaire',
+            'senior': 'avancé',
+            'expert': 'avancé'
+        }
+        
+        difficulty = difficulty_map.get(niveau, 'intermédiaire')
+        
+        # Essayer d'utiliser Ollama s'il est disponible
+        try:
+            import ollama
+            
+            # Limiter à 3 mots-clés pour éviter des requêtes trop longues
+            selected_keywords = keywords[:3]
+            competency_tests = []
+            
+            # Générer des tests pour chaque compétence
+            for keyword in selected_keywords:
+                question_prompt = (
+                    f"Generate exactly 3 multiple-choice questions for the competency '{keyword}' at a {difficulty} level. "
+                    f"The JSON response must contain exactly 3 objects, each representing a question. Each object should have: "
+                    f"'question' (string), 'options' (list of strings), and 'correct_answer' (string matching one of the options). "
+                    f"Example JSON format: "
+                    f'[{{"question": "What is 2+2?", "options": ["A: 1", "B: 2", "C: 4"], "correct_answer": "C: 4", "explanation": "Basic arithmetic"}}, ...]. '
+                    f"Response format must be valid JSON."
+                )
+                
+                # Appeler le modèle Ollama
+                try:
+                    response = ollama.chat(model='llama3:8b', messages=[{
+                        'role': 'user',
+                        'content': question_prompt,
+                    }])
+                    
+                    response_content = response.get('message', {}).get('content', '')
+                    
+                    # Extraire le JSON de la réponse (peut être entouré de ```json ```)
+                    import re
+                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_content)
+                    if json_match:
+                        json_content = json_match.group(1)
+                    else:
+                        json_content = response_content
+                    
+                    # Essayer de parser le JSON
+                    try:
+                        questions = json.loads(json_content)
+                        for question in questions:
+                            competency_tests.append(question)
+                    except json.JSONDecodeError:
+                        # Fallback si le parsing échoue
+                        logger.warning(f"Impossible de parser la réponse JSON pour '{keyword}'")
+                        competency_tests.append({
+                            "question": f"Question basique pour tester les connaissances",
+                            "options": ["A: Option 1", "B: Option 2", "C: Option 3", "D: Option 4"],
+                            "correct_answer": "A: Option 1",
+                            "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+                        })
+                except Exception as ollama_error:
+                    logger.warning(f"Erreur lors de l'appel à Ollama pour '{keyword}': {str(ollama_error)}")
+                    competency_tests.append({
+                        "question": f"Question basique pour tester les connaissances de {keyword}",
+                        "options": ["A: Option 1", "B: Option 2", "C: Option 3", "D: Option 4"],
+                        "correct_answer": "A: Option 1",
+                        "explanation": "Réponse générée automatiquement car le service Ollama a rencontré une erreur."
+                    })
+            
+            # Créer le test final
+            return {
+                "title": f"Test technique pour {job_offer.get('title', 'poste non spécifié')}",
+                "niveau": niveau,
+                "qcm": competency_tests,
+                "keywords": selected_keywords
+            }
+            
+        except ImportError:
+            logger.warning("Ollama n'est pas disponible")
+            # Utiliser une génération de secours si Ollama n'est pas disponible
+            return generate_fallback_test(keywords, niveau)
+
+    except Exception as e:
+        logger.error(f"Erreur lors de la génération du test: {str(e)}")
+        return {"error": str(e)}
+
+def generate_fallback_test(keywords, niveau):
+    """
+    Génère un test de secours lorsque Ollama n'est pas disponible.
+    """
+    # Questions génériques par catégorie
+    test_templates = {
+        "programmation": [
+            {
+                "question": "Quelle est la complexité temporelle de l'algorithme de tri rapide (quicksort) dans le cas moyen?",
+                "options": ["A: O(n)", "B: O(n log n)", "C: O(n²)", "D: O(log n)"],
+                "correct_answer": "B: O(n log n)",
+                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+            }
+        ],
+        "web": [
+            {
+                "question": "Quelle méthode HTTP est généralement utilisée pour créer une nouvelle ressource sur un serveur?",
+                "options": ["A: GET", "B: POST", "C: PUT", "D: DELETE"],
+                "correct_answer": "B: POST",
+                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+            }
+        ],
+        "données": [
+            {
+                "question": "Quelle instruction SQL est utilisée pour récupérer des données d'une base de données?",
+                "options": ["A: SELECT", "B: UPDATE", "C: INSERT", "D: DELETE"],
+                "correct_answer": "A: SELECT",
+                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+            }
+        ],
+        "frontend": [
+            {
+                "question": "Quel framework JavaScript permet de créer des interfaces utilisateur avec une approche basée sur les composants?",
+                "options": ["A: jQuery", "B: React", "C: Lodash", "D: Express"],
+                "correct_answer": "B: React",
+                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+            }
+        ],
+        "backend": [
+            {
+                "question": "Quel framework Python est couramment utilisé pour développer des applications Web?",
+                "options": ["A: NumPy", "B: Pandas", "C: Flask", "D: Matplotlib"],
+                "correct_answer": "C: Flask",
+                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+            }
+        ],
+        "cloud": [
+            {
+                "question": "Quel service AWS est utilisé pour héberger des conteneurs Docker?",
+                "options": ["A: EC2", "B: S3", "C: ECS", "D: DynamoDB"],
+                "correct_answer": "C: ECS",
+                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+            }
+        ],
+        "ai": [
+            {
+                "question": "Quelle technique d'apprentissage automatique permet à un modèle d'apprendre à partir d'exemples étiquetés?",
+                "options": ["A: Apprentissage supervisé", "B: Apprentissage non supervisé", "C: Apprentissage par renforcement", "D: Apprentissage semi-supervisé"],
+                "correct_answer": "A: Apprentissage supervisé",
+                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+            }
+        ],
+        "default": [
+            {
+                "question": "Question basique pour tester les connaissances",
+                "options": ["A: Option 1", "B: Option 2", "C: Option 3", "D: Option 4"],
+                "correct_answer": "A: Option 1",
+                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+            }
+        ]
+    }
+    
+    # Catégoriser les mots-clés
+    categories = {
+        "programmation": ["python", "java", "javascript", "c++", "ruby", "php", "golang", "swift", "algo", "algorithm"],
+        "web": ["html", "css", "http", "api", "rest", "graphql", "ajax", "spa", "pwa"],
+        "données": ["sql", "mongodb", "nosql", "database", "data", "json", "xml"],
+        "frontend": ["react", "angular", "vue", "redux", "bootstrap", "sass", "less", "webpack", "frontend"],
+        "backend": ["nodejs", "django", "flask", "spring", "express", "backend", "api"],
+        "cloud": ["aws", "azure", "gcp", "docker", "kubernetes", "serverless", "cloud"],
+        "ai": ["machine learning", "ml", "ai", "deep learning", "neural", "nlp", "computer vision", "cv", "llm"]
+    }
+    
+    # Classifier les mots-clés par catégorie
+    keyword_categories = set()
+    for keyword in keywords:
+        keyword_lower = keyword.lower()
+        for category, category_keywords in categories.items():
+            if any(cat_keyword in keyword_lower for cat_keyword in category_keywords):
+                keyword_categories.add(category)
+                break
+    
+    # Si aucune catégorie n'est trouvée, utiliser la catégorie par défaut
+    if not keyword_categories:
+        keyword_categories.add("default")
+    
+    # Sélectionner une question par catégorie trouvée
+    qcm = []
+    for category in keyword_categories:
+        template = test_templates.get(category, test_templates["default"])
+        qcm.extend(template)
+    
+    # Assurer au moins 3 questions
+    while len(qcm) < 3:
+        qcm.append(test_templates["default"][0])
+    
+    return {
+        "title": f"Test technique pour les compétences: {', '.join(keywords[:3])}",
+        "niveau": niveau,
+        "qcm": qcm,
+        "keywords": keywords[:3]
+    }
 
 # Initialize Flask routes
 def init_routes(app):

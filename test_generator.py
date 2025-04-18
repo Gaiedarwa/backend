@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Ollama API settings
 OLLAMA_BASE_URL = "http://localhost:11434/api"  # Default Ollama API URL
-OLLAMA_MODEL = "llama3"  # Default to llama3
+OLLAMA_MODELS = ["llama3", "llama2", "mistral", "gemma"]  # Liste des modèles à essayer dans l'ordre
 
 def is_technical_domain(keywords, title=None, description=None):
     """
@@ -209,6 +209,52 @@ Formate ta réponse en JSON avec cette structure:
     
     return prompt
 
+def get_available_models():
+    """
+    Récupère la liste des modèles disponibles sur le serveur Ollama
+    
+    Returns:
+        list: Liste des modèles disponibles
+    """
+    try:
+        response = requests.get(f"{OLLAMA_BASE_URL}/tags", timeout=5)
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            return [model.get("name") for model in models]
+        else:
+            logger.warning(f"Impossible de récupérer les modèles: {response.status_code}")
+            return []
+    except Exception as e:
+        logger.warning(f"Erreur lors de la récupération des modèles: {str(e)}")
+        return []
+
+def get_best_model():
+    """
+    Détermine le meilleur modèle disponible à utiliser
+    
+    Returns:
+        str: Nom du modèle à utiliser
+    """
+    available_models = get_available_models()
+    
+    if not available_models:
+        logger.warning("Impossible de récupérer les modèles disponibles. Utilisation du modèle par défaut.")
+        return OLLAMA_MODELS[0]  # Utiliser le premier modèle par défaut
+    
+    # Trouver le premier modèle disponible dans l'ordre de préférence
+    for model in OLLAMA_MODELS:
+        if model in available_models:
+            logger.info(f"Utilisation du modèle: {model}")
+            return model
+            
+    # Si aucun des modèles préférés n'est disponible, utiliser le premier disponible
+    if available_models:
+        logger.info(f"Aucun modèle préféré disponible. Utilisation de: {available_models[0]}")
+        return available_models[0]
+    
+    # Si vraiment aucun modèle n'est disponible, utiliser le premier de la liste
+    return OLLAMA_MODELS[0]
+
 def query_ollama(prompt):
     """
     Send a query to Ollama API
@@ -220,10 +266,25 @@ def query_ollama(prompt):
         str: The generated response from Ollama
     """
     try:
+        # Sélectionner le meilleur modèle disponible
+        model = get_best_model()
+        logger.info(f"Utilisation du modèle: {model} pour générer le test")
+        
+        # Vérifier si le serveur Ollama est disponible
+        try:
+            healthcheck = requests.get(f"{OLLAMA_BASE_URL}/tags", timeout=3)
+            if healthcheck.status_code != 200:
+                logger.warning(f"Le serveur Ollama n'est pas accessible: {healthcheck.status_code}")
+                return generate_fallback_response(prompt)
+        except Exception as e:
+            logger.warning(f"Le serveur Ollama n'est pas accessible: {str(e)}")
+            return generate_fallback_response(prompt)
+        
+        # Envoyer la requête au serveur Ollama
         response = requests.post(
             f"{OLLAMA_BASE_URL}/generate",
             json={
-                "model": OLLAMA_MODEL,
+                "model": model,
                 "prompt": prompt,
                 "stream": False
             },
@@ -232,13 +293,77 @@ def query_ollama(prompt):
         
         if response.status_code != 200:
             logger.error(f"Error from Ollama API: {response.status_code} - {response.text}")
-            return None
+            # Essayer une alternative si le modèle n'est pas trouvé
+            if "not found" in response.text.lower() or response.status_code == 404:
+                logger.warning(f"Le modèle {model} n'a pas été trouvé, génération d'une réponse de secours")
+                return generate_fallback_response(prompt)
+            return generate_fallback_response(prompt)
         
         return response.json().get("response", "")
     
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error connecting to Ollama: {str(e)}")
+        return generate_fallback_response(prompt)
     except Exception as e:
-        logger.error(f"Error querying Ollama: {str(e)}")
-        return None
+        logger.error(f"Unexpected error querying Ollama: {str(e)}")
+        return generate_fallback_response(prompt)
+
+def generate_fallback_response(prompt):
+    """
+    Génère une réponse de secours basique lorsque Ollama n'est pas disponible
+    
+    Args:
+        prompt (str): Le prompt original
+        
+    Returns:
+        str: Une réponse JSON basique
+    """
+    logger.warning("Génération d'une réponse de secours car Ollama n'est pas disponible")
+    
+    # Extraire des mots-clés du prompt pour créer une réponse basique
+    keywords = []
+    if "compétences suivantes:" in prompt:
+        skills_part = prompt.split("compétences suivantes:")[1].split(".")[0]
+        keywords = [k.strip() for k in skills_part.split(",")]
+    
+    # Déterminer s'il s'agit d'un test technique ou non
+    is_technical = "test technique" in prompt.lower() or "développement" in prompt.lower()
+    
+    if is_technical:
+        response = {
+            "qcm": [
+                {
+                    "question": "Question basique sur les fondamentaux",
+                    "options": ["A: Option 1", "B: Option 2", "C: Option 3", "D: Option 4"],
+                    "correct_answer": "A",
+                    "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+                }
+            ],
+            "programming_exercises": [
+                {
+                    "title": "Exercice de programmation basique",
+                    "description": "Écrire une fonction simple",
+                    "example": "Entrée/Sortie: exemple",
+                    "constraints": "Contraintes basiques",
+                    "skeleton_code": "def fonction():\n    pass",
+                    "solution": "def fonction():\n    return 'solution'"
+                }
+            ]
+        }
+    else:
+        response = {
+            "qcm": [
+                {
+                    "question": "Question basique pour tester les connaissances",
+                    "options": ["A: Option 1", "B: Option 2", "C: Option 3", "D: Option 4"],
+                    "correct_answer": "A",
+                    "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
+                }
+            ]
+        }
+    
+    # Convertir en JSON et retourner
+    return json.dumps(response)
 
 def generate_test(job_offer):
     """

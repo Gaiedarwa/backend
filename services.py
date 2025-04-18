@@ -95,4 +95,4 @@ def get_embedding(text):
     seed = int(hex_dig, 16) % (2**32)
     np.random.seed(seed)
     
-    return np.random.rand(768)  # Dimension courante pour les embeddings 
+    return np.random.rand(768)  # Dimension courante pour les embeddings
