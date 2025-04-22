@@ -20,6 +20,7 @@ from skills import TECH_SKILLS  # Import the TECH_SKILLS dictionary
 from metrics import calculate_matching_metrics  # Import the metrics module
 from test_generator import generate_test  # Import the test generator module
 from open_application import OpenApplicationProcessor  # Import the open application processor
+import ollama
 
 # Configure logging
 logging.basicConfig(
@@ -474,6 +475,8 @@ def calculate_matching_metrics(candidate_skills, job_requirements, matched_skill
 def apply_to_offer():
     try:
         logger.info("Requête reçue sur /apply")
+        
+        # Vérifier la présence des éléments requis
         if 'cv' not in request.files or 'offer_id' not in request.form:
             return jsonify({'error': 'Le CV et l\'ID de l\'offre sont requis'}), 400
         
@@ -481,6 +484,11 @@ def apply_to_offer():
         offer_id = request.form['offer_id']
         if cv_file.filename == '':
             return jsonify({'error': 'Aucun fichier sélectionné'}), 400
+        
+        # Récupérer les champs de formulaire supplémentaires (optionnels)
+        form_name = request.form.get('name', '')
+        form_email = request.form.get('email', '')
+        form_telephone = request.form.get('telephone', '')
         
         # Extraire le texte du CV
         cv_text = ""
@@ -530,15 +538,25 @@ def apply_to_offer():
         # Extraire les entités et les compétences
         entities = extract_entities(cv_text)
         
-        # Améliorer la détection du nom avec la nouvelle fonction
-        detected_name = extract_name_improved(cv_text)
-        if detected_name:
-            entities['name'] = detected_name
+        # Utiliser les informations du formulaire si fournies, sinon utiliser les informations extraites
+        if form_name:
+            entities['name'] = form_name
+        else:
+            # Améliorer la détection du nom avec la nouvelle fonction
+            detected_name = extract_name_improved(cv_text)
+            if detected_name:
+                entities['name'] = detected_name
         
-        # Améliorer la détection du numéro de téléphone
-        phone = extract_phone_numbers(cv_text)
-        if phone:
-            entities['telephone'] = phone
+        if form_email:
+            entities['email'] = form_email
+                
+        if form_telephone:
+            entities['telephone'] = form_telephone
+        else:
+            # Améliorer la détection du numéro de téléphone
+            phone = extract_phone_numbers(cv_text)
+            if phone:
+                entities['telephone'] = phone
         
         # Améliorer l'extraction des compétences
         extracted_skills = optimize_skill_extraction(cv_text)
@@ -623,7 +641,8 @@ def apply_to_offer():
                     'job_keywords': job_keywords,
                     'metrics': metrics  # Conserver les métriques dans la base de données
                 },
-                'date_applied': datetime.now()
+                'date_applied': datetime.now(),
+                'source': 'form_submission'
             }).inserted_id
             
             application_id = str(application_id)
@@ -683,6 +702,11 @@ def job_offers_post():
             location = data.get('location', '')
             level = data.get('level', '')
             description_text = data.get('description', '')
+            job_id = data.get('job_id', '')
+            work_type = data.get('work_type', '')
+            contract_type = data.get('contract_type', '')
+            responsibilities = data.get('responsibilities', [])
+            profile = data.get('profile', [])
             
             # Récupérer les mots-clés s'ils sont fournis
             if 'keywords' in data:
@@ -694,6 +718,10 @@ def job_offers_post():
                 # Extraire les mots-clés du texte
                 keywords = optimize_skill_extraction(description_text, job_related=True)
             
+            # Déterminer automatiquement le niveau si non fourni
+            if not level:
+                level = determine_job_level(description_text, profile, title)
+            
             # Générer une description enrichie si nécessaire
             if description_text:
                 desc_result = generate_job_description(keywords)
@@ -704,29 +732,28 @@ def job_offers_post():
                     # N'écrasez les mots-clés que s'ils n'ont pas été fournis
                     if not keywords:
                         keywords = desc_result.get('keywords', [])
-                    requirements = desc_result.get('requirements', [])
-                    responsibilities = desc_result.get('responsibilities', [])
+                    if not responsibilities:
+                        responsibilities = desc_result.get('responsibilities', [])
                 else:
                     description = desc_result if desc_result else description_text
                     if not keywords:
                         keywords = optimize_skill_extraction(description_text, job_related=True)
-                    requirements = []
-                    responsibilities = []
             else:
                 description = ""
-                requirements = []
-                responsibilities = []
             
             # Création de l'objet job_offer
             job_offer = {
+                'job_id': job_id,
                 'title': title,
                 'company': company,
                 'location': location,
                 'level': level,
                 'description': description,
+                'work_type': work_type, 
+                'contract_type': contract_type,
                 'keywords': keywords,
-                'requirements': requirements,
                 'responsibilities': responsibilities,
+                'profile': profile,
                 'created_at': datetime.now()
             }
             
@@ -734,9 +761,9 @@ def job_offers_post():
             job_id = offers_collection.insert_one(job_offer).inserted_id
             job_offer['_id'] = str(job_id)
             
-            return jsonify({'job_id': str(job_id), 'job_offer': job_offer}), 201
+            return jsonify({'job_id': str(job_id), 'job_offer': job_offer, 'extracted_keywords': keywords}), 201
         
-        # Si pas de JSON, chercher le fichier dans la requête
+        # Si pas de JSON, rechercher les données dans form data et fichiers
         job_file = None
         
         # Vérifier tous les noms possibles du fichier
@@ -745,71 +772,83 @@ def job_offers_post():
         elif 'offer' in request.files and request.files['offer'].filename:
             job_file = request.files['offer']
         
-        # Si aucun fichier trouvé
-        if not job_file:
-            return jsonify({'error': 'Un fichier PDF ou image est requis'}), 400
-            
-        # Extraire le texte du fichier
         job_text = ""
-        filename = job_file.filename.lower()
         
-        try:
-            if filename.endswith('.pdf'):
-                # Extraction de texte du PDF
-                import PyPDF2
-                pdf_reader = PyPDF2.PdfReader(job_file)
-                for page in pdf_reader.pages:
-                    job_text += page.extract_text() + "\n"
-            elif any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png']):
-                # OCR pour les images
-                try:
-                    import pytesseract
-                    from PIL import Image
-                    import io
-                    
-                    image = Image.open(io.BytesIO(job_file.read()))
-                    job_text = pytesseract.image_to_string(image, lang='fra+eng')
-                except ImportError:
-                    return jsonify({'error': 'Libraries for image processing not installed. Try: pip install pytesseract Pillow'}), 500
-            else:
-                return jsonify({'error': 'Format de fichier non supporté. Utilisez PDF, JPG ou PNG'}), 400
-        except Exception as file_error:
-            logger.error(f"Erreur lors de l'extraction du texte du fichier: {str(file_error)}")
-            return jsonify({'error': f"Erreur lors de l'extraction du texte du fichier: {str(file_error)}"}), 400
+        # Extraire le texte du fichier si disponible
+        if job_file:
+            filename = job_file.filename.lower()
+            
+            try:
+                if filename.endswith('.pdf'):
+                    # Extraction de texte du PDF
+                    import PyPDF2
+                    pdf_reader = PyPDF2.PdfReader(job_file)
+                    for page in pdf_reader.pages:
+                        job_text += page.extract_text() + "\n"
+                elif any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png']):
+                    # OCR pour les images
+                    try:
+                        import pytesseract
+                        from PIL import Image
+                        import io
+                        
+                        image = Image.open(io.BytesIO(job_file.read()))
+                        job_text = pytesseract.image_to_string(image, lang='fra+eng')
+                    except ImportError:
+                        return jsonify({'error': 'Libraries for image processing not installed. Try: pip install pytesseract Pillow'}), 500
+                else:
+                    return jsonify({'error': 'Format de fichier non supporté. Utilisez PDF, JPG ou PNG'}), 400
+            except Exception as file_error:
+                logger.error(f"Erreur lors de l'extraction du texte du fichier: {str(file_error)}")
+                return jsonify({'error': f"Erreur lors de l'extraction du texte du fichier: {str(file_error)}"}), 400
         
-        # Récupérer texte supplémentaire (optionnel) - toujours optionnel même si le texte extrait est vide
+        # Récupérer texte supplémentaire (optionnel)
         additional_text = request.form.get('job_text', '')
         if additional_text:
             job_text = job_text + "\n\n" + additional_text
         
-        # Si le texte extrait est vide et qu'il n'y a pas de texte supplémentaire, ce n'est pas un problème
-        # On continue avec un texte vide et on se base sur les métadonnées
-        
-        # Récupérer les autres métadonnées
+        # Récupérer les champs du formulaire
         title = request.form.get('title', 'Poste non spécifié')
         company = request.form.get('company', 'Entreprise non spécifiée')
         location = request.form.get('location', '')
         level = request.form.get('level', '')
+        custom_job_id = request.form.get('job_id', '')
+        work_type = request.form.get('work_type', '')
+        contract_type = request.form.get('contract_type', '')
         
-        # Extraire les mots-clés si possible ou utiliser une liste vide
-        keywords = []
-        if job_text:
+        # Récupérer les sections spécifiques si fournies dans le formulaire
+        responsibilities_text = request.form.get('responsibilities', '')
+        responsibilities = [r.strip() for r in responsibilities_text.split('\n')] if responsibilities_text else []
+        
+        profile_text = request.form.get('profile', '')
+        profile = [p.strip() for p in profile_text.split('\n')] if profile_text else []
+        
+        # Récupérer les mots-clés s'ils sont fournis
+        keywords_text = request.form.get('keywords', '')
+        if keywords_text:
+            keywords = [k.strip() for k in keywords_text.split(',')]
+        elif job_text:
             keywords = optimize_skill_extraction(job_text, job_related=True)
+        else:
+            keywords = []
+        
+        # Déterminer automatiquement le niveau si non fourni
+        if not level:
+            level = determine_job_level(job_text, profile, title)
         
         # Générer une description enrichie si possible
         enriched_description = ""
-        requirements = []
-        responsibilities = []
-        
-        if keywords:
+        if not responsibilities and keywords:
             try:
                 desc_result = generate_job_description(keywords)
                 
                 # Si la génération a retourné un dictionnaire, utiliser ses valeurs
                 if isinstance(desc_result, dict):
                     enriched_description = desc_result.get('description', '')
-                    requirements = desc_result.get('requirements', [])
-                    responsibilities = desc_result.get('responsibilities', [])
+                    if not responsibilities:
+                        responsibilities = desc_result.get('responsibilities', [])
+                    if not profile:
+                        profile = desc_result.get('requirements', [])
                 else:
                     enriched_description = desc_result if desc_result else job_text
             except Exception as gen_error:
@@ -817,28 +856,102 @@ def job_offers_post():
         
         # Construire l'objet d'offre d'emploi
         job_offer = {
+            'job_id': custom_job_id,
             'title': title,
             'company': company,
             'location': location,
             'level': level,
+            'work_type': work_type,
+            'contract_type': contract_type,
             'description': job_text,  # Texte brut de l'offre (peut être vide)
             'enriched_description': enriched_description,  # Description enrichie par l'IA (peut être vide)
             'keywords': keywords,
-            'requirements': requirements,
             'responsibilities': responsibilities,
+            'profile': profile,
             'created_at': datetime.now(),
-            'source': 'file_upload'
+            'source': 'file_upload' if job_file else 'form_input'
         }
         
         # Insertion en base de données
         job_id = offers_collection.insert_one(job_offer).inserted_id
         job_offer['_id'] = str(job_id)
         
-        return jsonify({'job_id': str(job_id), 'job_offer': job_offer}), 201
+        return jsonify({
+            'job_id': str(job_id), 
+            'job_offer': job_offer, 
+            'extracted_keywords': keywords,
+            'level': level
+        }), 201
         
     except Exception as e:
         logger.error(f"Erreur lors du traitement: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+def determine_job_level(description_text, profile, title):
+    """
+    Détermine automatiquement le niveau de l'offre d'emploi (junior/senior)
+    en fonction du texte de description, du profil requis et du titre.
+    
+    Args:
+        description_text (str): Texte de description de l'offre
+        profile (list): Liste des exigences du profil
+        title (str): Titre du poste
+        
+    Returns:
+        str: 'junior', 'intermédiaire' ou 'senior'
+    """
+    # Convertir en texte pour l'analyse
+    text_to_analyze = ""
+    if description_text:
+        text_to_analyze += description_text + " "
+    
+    if isinstance(profile, list):
+        text_to_analyze += " ".join(profile) + " "
+    elif isinstance(profile, str):
+        text_to_analyze += profile + " "
+        
+    text_to_analyze += title
+    text_to_analyze = text_to_analyze.lower()
+    
+    # Termes indiquant un poste senior
+    senior_terms = [
+        'senior', 'lead', 'principal', 'chef', 'architecte', 'manager', 'director',
+        'expert', 'avancé', 'advanced', 'expérimenté', 'experienced',
+        '5+ ans', '5+ years', '7+ ans', '7+ years', '10+ ans', '10+ years',
+        'responsable', 'head of', 'strategy', 'stratégie', 'leadership'
+    ]
+    
+    # Termes indiquant un poste junior
+    junior_terms = [
+        'junior', 'stagiaire', 'intern', 'débutant', 'beginner', 'entry',
+        'apprenti', 'trainee', 'assistant', 'étudiant', 'student',
+        'niveau 1', 'level 1', '0-2 ans', '0-2 years', '1-3 ans', '1-3 years'
+    ]
+    
+    # Termes indiquant un niveau intermédiaire
+    intermediate_terms = [
+        'intermédiaire', 'intermediate', 'confirmé', 'confirmed', 'mid-level',
+        '2-5 ans', '2-5 years', '3-5 ans', '3-5 years'
+    ]
+    
+    # Compter les occurrences des termes
+    senior_count = sum(1 for term in senior_terms if term in text_to_analyze)
+    junior_count = sum(1 for term in junior_terms if term in text_to_analyze)
+    intermediate_count = sum(1 for term in intermediate_terms if term in text_to_analyze)
+    
+    # Déterminer le niveau en fonction du nombre d'occurrences
+    if senior_count > junior_count and senior_count > intermediate_count:
+        return 'senior'
+    elif junior_count > senior_count and junior_count > intermediate_count:
+        return 'junior'
+    elif intermediate_count > senior_count and intermediate_count > junior_count:
+        return 'intermédiaire'
+    elif senior_count > 0:
+        return 'senior'  # Par défaut senior si quelques termes senior trouvés
+    elif junior_count > 0:
+        return 'junior'  # Par défaut junior si quelques termes junior trouvés
+    else:
+        return 'intermédiaire'  # Niveau par défaut
 
 @bp.route('/job-offers', methods=['GET'])
 def get_all_offers():
@@ -1101,11 +1214,7 @@ def get_application_metrics(application_id):
 def generate_job_test():
     """
     Génère un test automatisé basé sur les mots-clés et le titre de l'offre d'emploi.
-    
-    - Accepte soit un tableau de mots-clés directement, soit un objet job_offer contenant
-      ces mots-clés.
-    - Si les mots-clés sont fournis sous forme de chaîne, les convertit en tableau.
-    - Utilise le module test_generator.py pour créer un test adapté.
+    Utilise le modèle llama3.2 d'Ollama si disponible, sinon utilise une méthode de secours.
     """
     try:
         logger.info("Requête reçue sur /generate-test")
@@ -1132,19 +1241,252 @@ def generate_job_test():
         if not keywords:
             return jsonify({'error': 'Liste de mots-clés vide'}), 400
         
-        # Préparer un objet job_offer minimal pour l'API generate_test
+        # Récupérer le niveau de difficulté
+        niveau = data.get('niveau', data.get('job_offer', {}).get('niveau', 'standard')).lower()
+        
+        # Mapper les niveaux aux difficultés
+        difficulty_map = {
+            'junior': 'débutant',
+            'débutant': 'débutant',
+            'standard': 'intermédiaire',
+            'confirmé': 'intermédiaire',
+            'intermédiaire': 'intermédiaire',
+            'senior': 'avancé',
+            'expert': 'avancé'
+        }
+        
+        difficulty = difficulty_map.get(niveau, 'intermédiaire')
+        
+        # Préparer un objet job_offer minimal pour l'API
         job_offer = {
             'keywords': keywords,
             'title': data.get('title', data.get('job_offer', {}).get('title', 'Test de compétences')),
-            'niveau': data.get('niveau', data.get('job_offer', {}).get('niveau', 'standard'))
+            'niveau': niveau
         }
         
-        logger.info(f"Génération d'un test pour les mots-clés: {keywords}")
-        test_data = generate_test(job_offer)
+        # Vérifier si Ollama est disponible
+        try:
+            import ollama
+            logger.info("Tentative de génération avec Ollama")
+            
+            competency_tests = []
+            
+            # Générer des questions pour chaque mot-clé avec llama3.2
+            for keyword in keywords:
+                question_prompt = (
+                    f"Génère exactement 3 questions à choix multiples sur la compétence '{keyword}', niveau {difficulty}. "
+                    f"Format JSON: [{{'question': '...', 'options': ['A: ...', 'B: ...', 'C: ...', 'D: ...'], "
+                    f"'correct_answer': 'A: ...', 'explanation': '...'}}]. "
+                    f"Réponds uniquement avec du JSON valide."
+                )
+                
+                try:
+                    try:
+                        # Essayer d'abord avec llama3.2
+                        response = ollama.chat(model='llama3.2', messages=[{
+                            'role': 'user',
+                            'content': question_prompt,
+                        }])
+                    except:
+                        # Sinon essayer avec llama3
+                        try:
+                            response = ollama.chat(model='llama3', messages=[{
+                                'role': 'user',
+                                'content': question_prompt,
+                            }])
+                        except:
+                            # Si aucun modèle ne fonctionne, lever une exception
+                            raise Exception("Aucun modèle Ollama disponible")
+                    
+                    response_content = response.get('message', {}).get('content', '')
+                    
+                    # Extraire le JSON de la réponse
+                    import re
+                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_content)
+                    if json_match:
+                        json_content = json_match.group(1)
+                    else:
+                        json_content = response_content
+                    
+                    # Nettoyer le JSON
+                    json_content = json_content.strip()
+                    if json_content.startswith('[') and not json_content.endswith(']'):
+                        json_content += ']'
+                    if not json_content.startswith('['):
+                        json_content = '[' + json_content + ']'
+                    
+                    # Parser le JSON
+                    try:
+                        questions = json.loads(json_content)
+                        
+                        # S'assurer que c'est une liste
+                        if not isinstance(questions, list):
+                            questions = [questions]
+                        
+                        # Ajouter le mot-clé à chaque question
+                        for q in questions:
+                            q['keyword'] = keyword
+                        
+                        competency_tests.extend(questions)
+                        
+                    except json.JSONDecodeError:
+                        # Si le parsing échoue, essayer une approche plus simple
+                        logger.warning(f"Échec du parsing JSON pour '{keyword}', tentative simplifiée")
+                        
+                        # Essayer un prompt plus simple
+                        simple_prompt = (
+                            f"Crée 2 questions à choix multiples sur {keyword}.\n"
+                            f"Pour chaque question, donne:\n"
+                            f"1. La question\n"
+                            f"2. 4 options (A, B, C, D)\n"
+                            f"3. La réponse correcte"
+                        )
+                        
+                        response = ollama.chat(model='llama3', messages=[{
+                            'role': 'user',
+                            'content': simple_prompt,
+                        }])
+                        
+                        content = response.get('message', {}).get('content', '')
+                        
+                        # Extraire manuellement les questions
+                        lines = content.split('\n')
+                        current_question = None
+                        options = []
+                        correct_answer = None
+                        
+                        for line in lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                                
+                            if line.startswith('Question') or re.match(r'^\d+\.', line):
+                                # Si on a déjà une question en cours, on la sauvegarde
+                                if current_question and options:
+                                    competency_tests.append({
+                                        'keyword': keyword,
+                                        'question': current_question,
+                                        'options': options,
+                                        'correct_answer': correct_answer or options[0],
+                                        'explanation': f"Question sur {keyword}"
+                                    })
+                                    options = []
+                                
+                                # Nouvelle question
+                                current_question = re.sub(r'^Question\s*\d+:?\s*', '', line)
+                                current_question = re.sub(r'^\d+\.\s*', '', current_question)
+                                
+                            elif line.startswith(('A:', 'B:', 'C:', 'D:')) or line.startswith(('A.', 'B.', 'C.', 'D.')):
+                                options.append(line.replace('.', ':') if line[1] == '.' else line)
+                                
+                            elif 'réponse' in line.lower() or 'correct' in line.lower():
+                                # Essayer de trouver la lettre de la réponse
+                                for letter in ['A', 'B', 'C', 'D']:
+                                    if letter in line:
+                                        for opt in options:
+                                            if opt.startswith(f"{letter}:"):
+                                                correct_answer = opt
+                                                break
+                        
+                        # Ajouter la dernière question
+                        if current_question and options:
+                            competency_tests.append({
+                                'keyword': keyword,
+                                'question': current_question,
+                                'options': options,
+                                'correct_answer': correct_answer or options[0],
+                                'explanation': f"Question sur {keyword}"
+                            })
+                        
+                        # Si on n'a pas pu extraire de questions, ajouter une question générique
+                        if not competency_tests or len(competency_tests) == 0:
+                            raise Exception("Aucune question extraite")
+                            
+                except Exception as e:
+                    logger.error(f"Erreur lors de la génération pour '{keyword}': {str(e)}")
+                    # En cas d'erreur, ajouter une question générique
+                    competency_tests.append({
+                        'keyword': keyword,
+                        'question': f"Quelle est la meilleure pratique lors de l'utilisation de {keyword}?",
+                        'options': [
+                            "A: Suivre la documentation officielle", 
+                            "B: Utiliser des bibliothèques tierces", 
+                            "C: Se fier uniquement à son expérience", 
+                            "D: Ignorer les conventions de nommage"
+                        ],
+                        'correct_answer': "A: Suivre la documentation officielle",
+                        'explanation': f"Il est toujours recommandé de suivre la documentation officielle pour {keyword}."
+                    })
+            
+            # Créer le test final
+            test_data = {
+                "title": f"Test technique pour {job_offer.get('title', 'poste non spécifié')}",
+                "niveau": niveau,
+                "qcm": competency_tests,
+                "keywords": keywords,
+                "generated_by": "llama3.2"
+            }
+            
+            return jsonify({
+                'test': test_data,
+                'job_offer': {
+                    'title': job_offer.get('title'),
+                    'keywords': job_offer.get('keywords'),
+                    'niveau': job_offer.get('niveau')
+                }
+            }), 200
+            
+        except ImportError:
+            # Ollama n'est pas disponible, utiliser le système de secours
+            logger.warning("Ollama n'est pas disponible, utilisation du mode de secours")
+        except Exception as ollama_error:
+            # Une erreur s'est produite avec Ollama, utiliser le système de secours
+            logger.error(f"Erreur avec Ollama: {str(ollama_error)}, utilisation du mode de secours")
+            
+        # ====== MODE DE SECOURS (sans Ollama) ======
+        logger.info("Génération de questions avec le système de secours")
         
-        if 'error' in test_data:
-            logger.error(f"Erreur lors de la génération du test: {test_data['error']}")
-            return jsonify({'error': test_data['error']}), 500
+        # Générer des questions pour tous les mots-clés
+        all_questions = []
+        
+        # Ajouter au moins une question par mot-clé
+        for keyword in keywords:
+            # Question générique 1
+            all_questions.append({
+                'keyword': keyword,
+                'question': f"Quelle est l'utilisation principale de {keyword}?",
+                'options': [
+                    "A: Développement frontend", 
+                    "B: Développement backend", 
+                    "C: Analyses de données", 
+                    "D: Toutes ces réponses selon le contexte"
+                ],
+                'correct_answer': "D: Toutes ces réponses selon le contexte",
+                'explanation': f"{keyword} peut être utilisé dans différents contextes selon les besoins spécifiques."
+            })
+            
+            # Question générique 2
+            all_questions.append({
+                'keyword': keyword,
+                'question': f"Quel est l'avantage principal de {keyword} par rapport à ses alternatives?",
+                'options': [
+                    "A: Performance", 
+                    "B: Facilité d'utilisation", 
+                    "C: Écosystème riche", 
+                    "D: Support communautaire"
+                ],
+                'correct_answer': "C: Écosystème riche",
+                'explanation': f"{keyword} est souvent reconnu pour son écosystème riche et ses nombreuses possibilités."
+            })
+        
+        # Créer le test final avec le système de secours
+        test_data = {
+            "title": f"Test technique pour {job_offer.get('title', 'poste non spécifié')}",
+            "niveau": niveau,
+            "qcm": all_questions,
+            "keywords": keywords,
+            "generated_by": "système de secours (sans Ollama)"
+        }
         
         return jsonify({
             'test': test_data,
@@ -1152,12 +1494,474 @@ def generate_job_test():
                 'title': job_offer.get('title'),
                 'keywords': job_offer.get('keywords'),
                 'niveau': job_offer.get('niveau')
-            }
+            },
+            'note': "Pour générer des questions plus personnalisées, installez Ollama avec: curl -fsSL https://ollama.ai/install.sh | sh"
         }), 200
-        
+            
     except Exception as e:
         logger.error(f"Erreur lors de la génération du test: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+def generate_with_ollama(keywords, difficulty, job_offer):
+    """
+    Génère des questions de test en utilisant le modèle Ollama llama3.2
+    """
+    import ollama
+    competency_tests = []
+    
+    # Générer des questions pour chaque mot-clé
+    for keyword in keywords:
+        question_prompt = (
+            f"Génère exactement 3 questions à choix multiples sur la compétence '{keyword}', niveau {difficulty}. "
+            f"Format JSON: [{{'question': '...', 'options': ['A: ...', 'B: ...', 'C: ...', 'D: ...'], "
+            f"'correct_answer': 'A: ...', 'explanation': '...'}}]. "
+            f"Réponds uniquement avec du JSON valide."
+        )
+        
+        try:
+            # Essayer d'abord llama3.2, puis llama3 si échoue
+            try:
+                response = ollama.chat(model='llama3.2', messages=[{
+                    'role': 'user',
+                    'content': question_prompt,
+                }])
+            except:
+                response = ollama.chat(model='llama3', messages=[{
+                    'role': 'user',
+                    'content': question_prompt,
+                }])
+            
+            response_content = response.get('message', {}).get('content', '')
+            
+            # Extraire le JSON de la réponse
+            import re
+            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_content)
+            if json_match:
+                json_content = json_match.group(1)
+            else:
+                json_content = response_content
+            
+            # Nettoyer le JSON
+            json_content = json_content.strip()
+            if json_content.startswith('[') and not json_content.endswith(']'):
+                json_content += ']'
+            if not json_content.startswith('['):
+                json_content = '[' + json_content + ']'
+            
+            # Parser le JSON
+            try:
+                questions = json.loads(json_content)
+                
+                # S'assurer que c'est une liste
+                if not isinstance(questions, list):
+                    questions = [questions]
+                
+                # Ajouter le mot-clé à chaque question
+                for q in questions:
+                    q['keyword'] = keyword
+                
+                competency_tests.extend(questions)
+                
+            except json.JSONDecodeError:
+                # Si le parsing échoue, essayer une approche plus simple
+                logger.warning(f"Échec du parsing JSON pour '{keyword}', tentative simplifiée")
+                
+                # Essayer un prompt plus simple
+                simple_prompt = (
+                    f"Crée 2 questions à choix multiples sur {keyword}.\n"
+                    f"Pour chaque question, donne:\n"
+                    f"1. La question\n"
+                    f"2. 4 options (A, B, C, D)\n"
+                    f"3. La réponse correcte"
+                )
+                
+                try:
+                    response = ollama.chat(model='llama3', messages=[{
+                        'role': 'user',
+                        'content': simple_prompt,
+                    }])
+                    
+                    content = response.get('message', {}).get('content', '')
+                    
+                    # Extraire manuellement les questions
+                    lines = content.split('\n')
+                    current_question = None
+                    options = []
+                    correct_answer = None
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                            
+                        if line.startswith('Question') or re.match(r'^\d+\.', line):
+                            # Si on a déjà une question en cours, on la sauvegarde
+                            if current_question and options:
+                                competency_tests.append({
+                                    'keyword': keyword,
+                                    'question': current_question,
+                                    'options': options,
+                                    'correct_answer': correct_answer or options[0],
+                                    'explanation': f"Question sur {keyword}"
+                                })
+                                options = []
+                            
+                            # Nouvelle question
+                            current_question = re.sub(r'^Question\s*\d+:?\s*', '', line)
+                            current_question = re.sub(r'^\d+\.\s*', '', current_question)
+                            
+                        elif line.startswith(('A:', 'B:', 'C:', 'D:')) or line.startswith(('A.', 'B.', 'C.', 'D.')):
+                            options.append(line.replace('.', ':') if line[1] == '.' else line)
+                            
+                        elif 'réponse' in line.lower() or 'correct' in line.lower():
+                            # Essayer de trouver la lettre de la réponse
+                            for letter in ['A', 'B', 'C', 'D']:
+                                if letter in line:
+                                    for opt in options:
+                                        if opt.startswith(f"{letter}:"):
+                                            correct_answer = opt
+                                            break
+                    
+                    # Ajouter la dernière question
+                    if current_question and options:
+                        competency_tests.append({
+                            'keyword': keyword,
+                            'question': current_question,
+                            'options': options,
+                            'correct_answer': correct_answer or options[0],
+                            'explanation': f"Question sur {keyword}"
+                        })
+                        
+                except Exception as parsing_error:
+                    logger.error(f"Erreur lors du parsing des questions: {str(parsing_error)}")
+                    # Ajouter une question de secours
+                    competency_tests.append(generate_basic_question(keyword))
+        except Exception as e:
+            logger.error(f"Erreur lors de la génération pour '{keyword}': {str(e)}")
+            # En cas d'erreur, ajouter une question générique
+            competency_tests.append(generate_basic_question(keyword))
+    
+    # Créer le test final
+    test_data = {
+        "title": f"Test technique pour {job_offer.get('title', 'poste non spécifié')}",
+        "niveau": job_offer.get('niveau', 'intermédiaire'),
+        "qcm": competency_tests,
+        "keywords": keywords,
+        "generated_by": "llama3.2"
+    }
+    
+    return jsonify({
+        'test': test_data,
+        'job_offer': {
+            'title': job_offer.get('title'),
+            'keywords': job_offer.get('keywords'),
+            'niveau': job_offer.get('niveau')
+        }
+    }), 200
+
+def generate_fallback_questions(keywords, niveau, job_offer):
+    """
+    Génère des questions de test basiques sans dépendre d'Ollama
+    """
+    logger.info("Génération de questions de secours sans Ollama")
+    
+    # Questions de base par compétence
+    all_questions = []
+    
+    # Générer au moins une question par mot-clé
+    for keyword in keywords:
+        # Ajouter des questions spécifiques au mot-clé
+        keyword_questions = generate_questions_for_keyword(keyword, niveau)
+        all_questions.extend(keyword_questions)
+    
+    # Créer le test final
+    test_data = {
+        "title": f"Test technique pour {job_offer.get('title', 'poste non spécifié')}",
+        "niveau": niveau,
+        "qcm": all_questions,
+        "keywords": keywords,
+        "generated_by": "système de secours (sans Ollama)"
+    }
+    
+    return jsonify({
+        'test': test_data,
+        'job_offer': {
+            'title': job_offer.get('title'),
+            'keywords': job_offer.get('keywords'),
+            'niveau': job_offer.get('niveau')
+        },
+        'note': "Pour générer des questions plus personnalisées, installez Ollama avec: curl -fsSL https://ollama.ai/install.sh | sh"
+    }), 200
+
+def generate_questions_for_keyword(keyword, niveau):
+    """
+    Génère des questions spécifiques pour un mot-clé donné
+    """
+    # Questions génériques adaptables
+    questions = []
+    
+    # Questions universelles qui peuvent être adaptées à n'importe quel mot-clé
+    base_templates = [
+        {
+            "question_template": "Quelle est l'utilisation principale de {keyword}?",
+            "options": [
+                "A: Développement frontend", 
+                "B: Développement backend", 
+                "C: Analyses de données", 
+                "D: Toutes ces réponses selon le contexte"
+            ],
+            "correct_answer": "D: Toutes ces réponses selon le contexte",
+            "explanation_template": "{keyword} peut être utilisé dans différents contextes selon les besoins spécifiques."
+        },
+        {
+            "question_template": "Quel est l'avantage principal de {keyword} par rapport à ses alternatives?",
+            "options": [
+                "A: Performance", 
+                "B: Facilité d'utilisation", 
+                "C: Écosystème riche", 
+                "D: Support communautaire"
+            ],
+            "correct_answer": "C: Écosystème riche",
+            "explanation_template": "{keyword} est souvent reconnu pour son écosystème riche et ses nombreuses possibilités."
+        },
+        {
+            "question_template": "Dans quel contexte {keyword} est-il particulièrement recommandé?",
+            "options": [
+                "A: Petits projets", 
+                "B: Projets d'entreprise", 
+                "C: Applications mobiles", 
+                "D: Applications web"
+            ],
+            "correct_answer": "D: Applications web",
+            "explanation_template": "{keyword} est fréquemment utilisé dans le développement d'applications web modernes."
+        }
+    ]
+    
+    # Questions spécifiques à certains domaines
+    domain_specific = {
+        # Programmation
+        "python": [
+            {
+                "question": "Quel type de langage est Python?",
+                "options": [
+                    "A: Langage compilé", 
+                    "B: Langage interprété", 
+                    "C: Langage assembleur", 
+                    "D: Langage binaire"
+                ],
+                "correct_answer": "B: Langage interprété",
+                "explanation": "Python est un langage interprété, ce qui signifie que le code est exécuté directement sans compilation préalable."
+            }
+        ],
+        "java": [
+            {
+                "question": "Quelle fonctionnalité est au cœur de Java?",
+                "options": [
+                    "A: Machine virtuelle (JVM)", 
+                    "B: Compilation en code natif", 
+                    "C: Typage dynamique", 
+                    "D: Gestion manuelle de la mémoire"
+                ],
+                "correct_answer": "A: Machine virtuelle (JVM)",
+                "explanation": "La machine virtuelle Java (JVM) permet à Java d'être indépendant de la plateforme."
+            }
+        ],
+        "javascript": [
+            {
+                "question": "Quelle est la particularité principale de JavaScript?",
+                "options": [
+                    "A: Il peut s'exécuter uniquement côté serveur", 
+                    "B: Il s'exécute dans le navigateur", 
+                    "C: Il nécessite une compilation", 
+                    "D: Il est fortement typé"
+                ],
+                "correct_answer": "B: Il s'exécute dans le navigateur",
+                "explanation": "JavaScript a été conçu pour s'exécuter côté client dans les navigateurs web."
+            }
+        ],
+        
+        # Web
+        "html": [
+            {
+                "question": "Que signifie HTML?",
+                "options": [
+                    "A: HyperText Markup Language", 
+                    "B: High-level Text Management Language", 
+                    "C: Home Tool Markup Language", 
+                    "D: Hybrid Text Manipulation Layer"
+                ],
+                "correct_answer": "A: HyperText Markup Language",
+                "explanation": "HTML (HyperText Markup Language) est le langage standard pour créer des pages web."
+            }
+        ],
+        "css": [
+            {
+                "question": "Quel est le rôle principal de CSS?",
+                "options": [
+                    "A: Gérer la logique d'une page web", 
+                    "B: Définir la structure d'une page web", 
+                    "C: Gérer le style et l'apparence", 
+                    "D: Gérer les interactions utilisateur"
+                ],
+                "correct_answer": "C: Gérer le style et l'apparence",
+                "explanation": "CSS (Cascading Style Sheets) est utilisé pour contrôler la présentation et le style des éléments HTML."
+            }
+        ],
+        
+        # Frameworks & Bibliothèques
+        "react": [
+            {
+                "question": "Quel concept est fondamental en React?",
+                "options": [
+                    "A: Les contrôleurs", 
+                    "B: Les composants", 
+                    "C: Les services", 
+                    "D: Les directives"
+                ],
+                "correct_answer": "B: Les composants",
+                "explanation": "React est basé sur l'architecture à composants, où l'interface est divisée en éléments réutilisables."
+            }
+        ],
+        "angular": [
+            {
+                "question": "Qu'est-ce qui distingue Angular?",
+                "options": [
+                    "A: C'est une bibliothèque légère", 
+                    "B: C'est un framework complet", 
+                    "C: Il utilise uniquement JavaScript", 
+                    "D: Il ne gère que le CSS"
+                ],
+                "correct_answer": "B: C'est un framework complet",
+                "explanation": "Angular est un framework complet qui fournit tout ce dont vous avez besoin pour construire des applications SPA."
+            }
+        ],
+        
+        # Backend & Serveurs
+        "node.js": [
+            {
+                "question": "Quelle est la particularité de Node.js?",
+                "options": [
+                    "A: Il exécute JavaScript côté serveur", 
+                    "B: Il est écrit en C++", 
+                    "C: Il ne peut gérer qu'une requête à la fois", 
+                    "D: Il est réservé au développement mobile"
+                ],
+                "correct_answer": "A: Il exécute JavaScript côté serveur",
+                "explanation": "Node.js permet d'exécuter du code JavaScript côté serveur, en dehors d'un navigateur."
+            }
+        ],
+        
+        # Bases de données
+        "sql": [
+            {
+                "question": "Que signifie SQL?",
+                "options": [
+                    "A: Simple Query Language", 
+                    "B: Structured Query Language", 
+                    "C: Sequential Query Language", 
+                    "D: Secure Query Logic"
+                ],
+                "correct_answer": "B: Structured Query Language",
+                "explanation": "SQL (Structured Query Language) est un langage de programmation conçu pour gérer les données dans les systèmes de gestion de bases de données relationnelles."
+            }
+        ],
+        "mongodb": [
+            {
+                "question": "Quel type de base de données est MongoDB?",
+                "options": [
+                    "A: Relationnelle", 
+                    "B: NoSQL orientée documents", 
+                    "C: Graphe", 
+                    "D: Hiérarchique"
+                ],
+                "correct_answer": "B: NoSQL orientée documents",
+                "explanation": "MongoDB est une base de données NoSQL orientée documents qui stocke les données au format BSON (JSON binaire)."
+            }
+        ],
+        
+        # DevOps
+        "docker": [
+            {
+                "question": "Quelle technologie est au cœur de Docker?",
+                "options": [
+                    "A: Virtualisation complète", 
+                    "B: Conteneurisation", 
+                    "C: Hyperviseurs de type 1", 
+                    "D: Machines virtuelles Java"
+                ],
+                "correct_answer": "B: Conteneurisation",
+                "explanation": "Docker utilise la conteneurisation pour empaqueter des applications avec leurs dépendances dans des unités standardisées."
+            }
+        ],
+        "kubernetes": [
+            {
+                "question": "Quel est le rôle principal de Kubernetes?",
+                "options": [
+                    "A: Développement d'applications", 
+                    "B: Orchestration de conteneurs", 
+                    "C: Virtualisation de serveurs", 
+                    "D: Gestion de bases de données"
+                ],
+                "correct_answer": "B: Orchestration de conteneurs",
+                "explanation": "Kubernetes est une plateforme d'orchestration de conteneurs qui automatise le déploiement, la mise à l'échelle et la gestion des applications conteneurisées."
+            }
+        ]
+    }
+    
+    # Chercher des questions spécifiques au mot-clé
+    if keyword.lower() in domain_specific:
+        specific_questions = domain_specific[keyword.lower()]
+        questions.extend([{**q, 'keyword': keyword} for q in specific_questions])
+    
+    # Si pas assez de questions spécifiques, ajouter des questions génériques
+    if len(questions) < 2:
+        # Chercher des correspondances partielles
+        for k, qs in domain_specific.items():
+            if k in keyword.lower() or keyword.lower() in k:
+                for q in qs:
+                    adapted_q = {
+                        **q,
+                        'keyword': keyword,
+                        'question': q['question'].replace(k, keyword),
+                        'explanation': q['explanation'].replace(k, keyword)
+                    }
+                    questions.append(adapted_q)
+                    if len(questions) >= 2:
+                        break
+            if len(questions) >= 2:
+                break
+    
+    # Si toujours pas assez de questions, utiliser les templates génériques
+    if len(questions) < 2:
+        for template in base_templates:
+            questions.append({
+                'keyword': keyword,
+                'question': template['question_template'].format(keyword=keyword),
+                'options': template['options'],
+                'correct_answer': template['correct_answer'],
+                'explanation': template['explanation_template'].format(keyword=keyword)
+            })
+            if len(questions) >= 3:
+                break
+    
+    return questions
+
+def generate_basic_question(keyword):
+    """
+    Génère une question basique pour un mot-clé donné
+    """
+    return {
+        'keyword': keyword,
+        'question': f"Quelle est la meilleure pratique lors de l'utilisation de {keyword}?",
+        'options': [
+            "A: Suivre la documentation officielle", 
+            "B: Utiliser des bibliothèques tierces", 
+            "C: Se fier uniquement à son expérience", 
+            "D: Ignorer les conventions de nommage"
+        ],
+        'correct_answer': "A: Suivre la documentation officielle",
+        'explanation': f"Il est toujours recommandé de suivre la documentation officielle pour {keyword}."
+    }
 
 # Amélioration de la détection du nom pour éviter de confondre avec des sections de CV
 def extract_name_improved(cv_text):
@@ -1286,231 +2090,14 @@ def calculate_semantic_similarity_enhanced(text1, text2):
     
     return max(0.0, min(1.0, final_similarity))  # Garantir que la valeur est entre 0 et 1
 
-# Fonction pour générer des tests techniques à partir de mots-clés
-def generate_test(job_offer):
-    """
-    Génère un test technique basé sur les mots-clés de l'offre d'emploi.
-    
-    Args:
-        job_offer (dict): L'offre d'emploi contenant les mots-clés et éventuellement le niveau
-        
-    Returns:
-        dict: Un test technique avec des questions QCM et de code
-    """
-    try:
-        # S'assurer que job_offer contient les champs requis
-        if not job_offer or 'keywords' not in job_offer:
-            return {"error": "Les données de l'offre d'emploi sont incomplètes"}
-        
-        keywords = job_offer.get('keywords', [])
-        if not keywords:
-            return {"error": "Aucun mot-clé trouvé pour générer un test"}
-        
-        # Déterminer le niveau de difficulté en fonction du niveau du poste
-        niveau = job_offer.get('niveau', 'standard').lower()
-        
-        # Mapper les niveaux aux difficultés
-        difficulty_map = {
-            'junior': 'débutant',
-            'débutant': 'débutant',
-            'standard': 'intermédiaire',
-            'confirmé': 'intermédiaire',
-            'senior': 'avancé',
-            'expert': 'avancé'
-        }
-        
-        difficulty = difficulty_map.get(niveau, 'intermédiaire')
-        
-        # Essayer d'utiliser Ollama s'il est disponible
-        try:
-            import ollama
-            
-            # Limiter à 3 mots-clés pour éviter des requêtes trop longues
-            selected_keywords = keywords[:3]
-            competency_tests = []
-            
-            # Générer des tests pour chaque compétence
-            for keyword in selected_keywords:
-                question_prompt = (
-                    f"Generate exactly 3 multiple-choice questions for the competency '{keyword}' at a {difficulty} level. "
-                    f"The JSON response must contain exactly 3 objects, each representing a question. Each object should have: "
-                    f"'question' (string), 'options' (list of strings), and 'correct_answer' (string matching one of the options). "
-                    f"Example JSON format: "
-                    f'[{{"question": "What is 2+2?", "options": ["A: 1", "B: 2", "C: 4"], "correct_answer": "C: 4", "explanation": "Basic arithmetic"}}, ...]. '
-                    f"Response format must be valid JSON."
-                )
-                
-                # Appeler le modèle Ollama
-                try:
-                    response = ollama.chat(model='llama3:8b', messages=[{
-                        'role': 'user',
-                        'content': question_prompt,
-                    }])
-                    
-                    response_content = response.get('message', {}).get('content', '')
-                    
-                    # Extraire le JSON de la réponse (peut être entouré de ```json ```)
-                    import re
-                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_content)
-                    if json_match:
-                        json_content = json_match.group(1)
-                    else:
-                        json_content = response_content
-                    
-                    # Essayer de parser le JSON
-                    try:
-                        questions = json.loads(json_content)
-                        for question in questions:
-                            competency_tests.append(question)
-                    except json.JSONDecodeError:
-                        # Fallback si le parsing échoue
-                        logger.warning(f"Impossible de parser la réponse JSON pour '{keyword}'")
-                        competency_tests.append({
-                            "question": f"Question basique pour tester les connaissances",
-                            "options": ["A: Option 1", "B: Option 2", "C: Option 3", "D: Option 4"],
-                            "correct_answer": "A: Option 1",
-                            "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-                        })
-                except Exception as ollama_error:
-                    logger.warning(f"Erreur lors de l'appel à Ollama pour '{keyword}': {str(ollama_error)}")
-                    competency_tests.append({
-                        "question": f"Question basique pour tester les connaissances de {keyword}",
-                        "options": ["A: Option 1", "B: Option 2", "C: Option 3", "D: Option 4"],
-                        "correct_answer": "A: Option 1",
-                        "explanation": "Réponse générée automatiquement car le service Ollama a rencontré une erreur."
-                    })
-            
-            # Créer le test final
-            return {
-                "title": f"Test technique pour {job_offer.get('title', 'poste non spécifié')}",
-                "niveau": niveau,
-                "qcm": competency_tests,
-                "keywords": selected_keywords
-            }
-            
-        except ImportError:
-            logger.warning("Ollama n'est pas disponible")
-            # Utiliser une génération de secours si Ollama n'est pas disponible
-            return generate_fallback_test(keywords, niveau)
-
-    except Exception as e:
-        logger.error(f"Erreur lors de la génération du test: {str(e)}")
-        return {"error": str(e)}
-
-def generate_fallback_test(keywords, niveau):
-    """
-    Génère un test de secours lorsque Ollama n'est pas disponible.
-    """
-    # Questions génériques par catégorie
-    test_templates = {
-        "programmation": [
-            {
-                "question": "Quelle est la complexité temporelle de l'algorithme de tri rapide (quicksort) dans le cas moyen?",
-                "options": ["A: O(n)", "B: O(n log n)", "C: O(n²)", "D: O(log n)"],
-                "correct_answer": "B: O(n log n)",
-                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-            }
-        ],
-        "web": [
-            {
-                "question": "Quelle méthode HTTP est généralement utilisée pour créer une nouvelle ressource sur un serveur?",
-                "options": ["A: GET", "B: POST", "C: PUT", "D: DELETE"],
-                "correct_answer": "B: POST",
-                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-            }
-        ],
-        "données": [
-            {
-                "question": "Quelle instruction SQL est utilisée pour récupérer des données d'une base de données?",
-                "options": ["A: SELECT", "B: UPDATE", "C: INSERT", "D: DELETE"],
-                "correct_answer": "A: SELECT",
-                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-            }
-        ],
-        "frontend": [
-            {
-                "question": "Quel framework JavaScript permet de créer des interfaces utilisateur avec une approche basée sur les composants?",
-                "options": ["A: jQuery", "B: React", "C: Lodash", "D: Express"],
-                "correct_answer": "B: React",
-                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-            }
-        ],
-        "backend": [
-            {
-                "question": "Quel framework Python est couramment utilisé pour développer des applications Web?",
-                "options": ["A: NumPy", "B: Pandas", "C: Flask", "D: Matplotlib"],
-                "correct_answer": "C: Flask",
-                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-            }
-        ],
-        "cloud": [
-            {
-                "question": "Quel service AWS est utilisé pour héberger des conteneurs Docker?",
-                "options": ["A: EC2", "B: S3", "C: ECS", "D: DynamoDB"],
-                "correct_answer": "C: ECS",
-                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-            }
-        ],
-        "ai": [
-            {
-                "question": "Quelle technique d'apprentissage automatique permet à un modèle d'apprendre à partir d'exemples étiquetés?",
-                "options": ["A: Apprentissage supervisé", "B: Apprentissage non supervisé", "C: Apprentissage par renforcement", "D: Apprentissage semi-supervisé"],
-                "correct_answer": "A: Apprentissage supervisé",
-                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-            }
-        ],
-        "default": [
-            {
-                "question": "Question basique pour tester les connaissances",
-                "options": ["A: Option 1", "B: Option 2", "C: Option 3", "D: Option 4"],
-                "correct_answer": "A: Option 1",
-                "explanation": "Réponse générée automatiquement car le service Ollama n'est pas disponible."
-            }
-        ]
-    }
-    
-    # Catégoriser les mots-clés
-    categories = {
-        "programmation": ["python", "java", "javascript", "c++", "ruby", "php", "golang", "swift", "algo", "algorithm"],
-        "web": ["html", "css", "http", "api", "rest", "graphql", "ajax", "spa", "pwa"],
-        "données": ["sql", "mongodb", "nosql", "database", "data", "json", "xml"],
-        "frontend": ["react", "angular", "vue", "redux", "bootstrap", "sass", "less", "webpack", "frontend"],
-        "backend": ["nodejs", "django", "flask", "spring", "express", "backend", "api"],
-        "cloud": ["aws", "azure", "gcp", "docker", "kubernetes", "serverless", "cloud"],
-        "ai": ["machine learning", "ml", "ai", "deep learning", "neural", "nlp", "computer vision", "cv", "llm"]
-    }
-    
-    # Classifier les mots-clés par catégorie
-    keyword_categories = set()
-    for keyword in keywords:
-        keyword_lower = keyword.lower()
-        for category, category_keywords in categories.items():
-            if any(cat_keyword in keyword_lower for cat_keyword in category_keywords):
-                keyword_categories.add(category)
-                break
-    
-    # Si aucune catégorie n'est trouvée, utiliser la catégorie par défaut
-    if not keyword_categories:
-        keyword_categories.add("default")
-    
-    # Sélectionner une question par catégorie trouvée
-    qcm = []
-    for category in keyword_categories:
-        template = test_templates.get(category, test_templates["default"])
-        qcm.extend(template)
-    
-    # Assurer au moins 3 questions
-    while len(qcm) < 3:
-        qcm.append(test_templates["default"][0])
-    
-    return {
-        "title": f"Test technique pour les compétences: {', '.join(keywords[:3])}",
-        "niveau": niveau,
-        "qcm": qcm,
-        "keywords": keywords[:3]
-    }
-
 # Initialize Flask routes
 def init_routes(app):
     # Register the Blueprint with the app
     app.register_blueprint(bp, url_prefix='/api')
+
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+    print("Module ollama non installé, utilisation du système de secours")
