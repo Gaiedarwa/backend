@@ -2093,6 +2093,7 @@ def calculate_semantic_similarity_enhanced(text1, text2):
 # Initialize Flask routes
 def init_routes(app):
     # Register the Blueprint with the app
+    
     app.register_blueprint(bp, url_prefix='/api')
 
 try:

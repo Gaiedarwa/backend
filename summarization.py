@@ -3,8 +3,6 @@ from collections import Counter
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
-import requests
-import json
 import os
 from dotenv import load_dotenv
 
